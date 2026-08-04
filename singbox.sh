@@ -626,7 +626,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _install_cloudflared _start_argo_tunnel _stop_argo_tunnel _enable_argo_watchdog
+export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
 server_ip=""
 BATCH_MODE=false
@@ -1280,6 +1280,8 @@ read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
         _warning "注意: 临时隧道每次重启域名会变化！"
     fi
 }
+
+export -f _install_cloudflared _start_argo_tunnel _stop_argo_tunnel _enable_argo_watchdog
 
 # 保留原始函数名作为薄包装器，确保向后兼容
 _add_argo_vless_ws() { _add_argo_node "vless"; }
