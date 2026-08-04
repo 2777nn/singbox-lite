@@ -1012,9 +1012,10 @@ _add_argo_node() {
     done
 
     # === [公共] WebSocket 路径 ===
-    read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
+read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
     if [ -z "$ws_path" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        local rand_path=$(openssl rand -hex 8 2>/dev/null || od -An -tx4 -N8 /dev/urandom | tr -d ' ')
+        ws_path="/${rand_path}"
         _info "已生成随机路径: ${ws_path}"
     else
         [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
@@ -1025,7 +1026,7 @@ _add_argo_node() {
     if [ "$protocol" == "trojan" ]; then
         read -p "请输入 Trojan 密码 (回车随机生成): " password
         if [ -z "$password" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
+            password=$(openssl rand -hex 16 2>/dev/null || od -An -tx4 -N16 /dev/urandom | tr -d ' ')
             _info "已生成随机密码: ${password}"
         fi
     fi
@@ -1094,7 +1095,13 @@ _add_argo_node() {
     local inbound_json=""
 
     if [ "$protocol" == "vless" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
+        if [ -x "$SINGBOX_BIN" ]; then
+            uuid=$(${SINGBOX_BIN} generate uuid)
+        elif command -v xray &>/dev/null; then
+            uuid=$(xray uuid)
+        else
+            uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+        fi
         inbound_json=$(jq -n \
             --arg t "$tag" \
             --arg p "$port" \
@@ -5471,7 +5478,7 @@ _main_menu() {
  
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
-            2) _require_singbox && _argo_menu ;;
+            2) _argo_menu ;;
             3) _require_singbox && _view_nodes ;;
             4) _require_singbox && _delete_node ;;
             5) _require_singbox && _modify_port ;;
