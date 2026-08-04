@@ -461,7 +461,6 @@ _uninstall_xray() {
         return
     fi
     
-    # 停止属于 Xray 的 Argo 隧道进程
     local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
     if [ -f "$argo_meta_file" ]; then
         jq -r 'to_entries[] | select(.value.core == "xray") | "\(.key)|\(.value.local_port)"' "$argo_meta_file" 2>/dev/null | while IFS='|' read -r atag aport; do
@@ -1529,7 +1528,6 @@ _delete_xray_node() {
     read -p "$(echo -e ${RED}"确定删除 [$target_name]? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     
-    # 停止关联的 Argo 隧道 (如果有)
     local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
     if [ -f "$argo_meta_file" ] && jq -e ".\"$target_tag\"" "$argo_meta_file" >/dev/null 2>&1; then
         _stop_argo_tunnel "$target_port"
@@ -1712,7 +1710,7 @@ _xray_add_node_menu() {
             6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
             7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
             8) _add_vless_xhttp_enc_vision_tls && _manage_xray_service "restart" ;;
-            9) _add_xray_argo_vless_xhttp_enc ;;
+            9) _add_xray_argo_vless_xhttp_enc && _manage_xray_service "restart" ;;
             10) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
             0) return ;;
             *) _error "无效输入" ;;
