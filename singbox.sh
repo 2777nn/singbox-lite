@@ -626,7 +626,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
+export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules _install_cloudflared _start_argo_tunnel _stop_argo_tunnel _enable_argo_watchdog
 
 server_ip=""
 BATCH_MODE=false
@@ -1288,49 +1288,45 @@ _view_argo_nodes() {
     fi
     
     echo "==================================================="
-    # 遍历并显示
-    jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.type)|\(.value.protocol)|\(.value.local_port)|\(.value.domain)|\(.value.uuid // "")|\(.value.path // "")|\(.value.password // "")"' "$ARGO_METADATA_FILE" | \
-    while IFS='|' read -r tag name argo_type protocol port domain uuid path password; do
-        echo -e "节点: ${GREEN}${name}${NC}"
+    jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.type)|\(.value.protocol)|\(.value.local_port)|\(.value.domain)|\(.value.uuid // "")|\(.value.path // "")|\(.value.password // "")|\(.value.enc_key // "")|\(.value.core // "sing-box")"' "$ARGO_METADATA_FILE" | \
+    while IFS='|' read -r tag name argo_type protocol port domain uuid path password enc_key core; do
+        echo -e "节点: ${GREEN}${name}${NC} [核心: ${CYAN}${core}${NC}]"
         echo -e "  协议: ${protocol}"
         echo -e "  端口: ${port}"
         
-        # 检查状态
         local pid_file="/tmp/singbox_argo_${port}.pid"
         local state="${RED}已停止${NC}"
-        local running_domain=""
         
-        # [M4] 一次读取 PID 到变量，避免重复 cat
         local pid=""
         if [ -f "$pid_file" ]; then pid=$(cat "$pid_file" 2>/dev/null); fi
         if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
              state="${GREEN}运行中${NC} (PID: $pid)"
-             # 如果是临时的，尝试从 log 读最新域名
              if [ "$argo_type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
                   local log_file="/tmp/singbox_argo_${port}.log"
                   local temp_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -1 | sed 's|https://||')
-                   [ -n "$temp_domain" ] && domain="$temp_domain"
+                  [ -n "$temp_domain" ] && domain="$temp_domain"
              fi
-             running_domain="$domain"
         fi
+        echo -e "  状态: ${state}"
         
         if [ -n "$domain" ] && [ "$domain" != "null" ]; then
              local link=""
-             
-             # [新架构] 优先使用持久化链接
              link=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE")
              
-              if [ -z "$link" ] || [ "$link" == "null" ]; then
+             if [ -z "$link" ] || [ "$link" == "null" ]; then
                   local safe_name=$(_url_encode "$name")
-                  local ed_path=$(_ws_path_with_early_data "$path")
-                  local safe_path=$(_url_encode "$ed_path")
-                  
                   if [[ "$protocol" == "vless-ws" ]]; then
+                      local safe_path=$(_url_encode "$(_ws_path_with_early_data "$path")")
                       link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
-                 elif [[ "$protocol" == "trojan-ws" ]]; then
-                     local safe_pw=$(_url_encode "$password")
-                     link="trojan://${safe_pw}@${domain}:443?security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
-                 fi
+                  elif [[ "$protocol" == "trojan-ws" ]]; then
+                      local safe_path=$(_url_encode "$(_ws_path_with_early_data "$path")")
+                      local safe_pw=$(_url_encode "$password")
+                      link="trojan://${safe_pw}@${domain}:443?security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
+                  elif [[ "$protocol" == "vless-xhttp-enc" ]]; then
+                      local safe_path=$(_url_encode "$path")
+                      local safe_enc=$(_url_encode "$enc_key")
+                      link="vless://${uuid}@${domain}:443?security=tls&encryption=${safe_enc}&flow=xtls-rprx-vision&sni=${domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${domain}#${safe_name}"
+                  fi
              fi
 
              if [ -n "$link" ]; then
@@ -1340,7 +1336,7 @@ _view_argo_nodes() {
         echo "-------------------------------------------"
     done
     
-    echo -e "${YELLOW}提示: 请使用 [9] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
+    echo -e "${YELLOW}提示: 请使用 [7] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
     echo "==================================================="
 }
 
@@ -1352,20 +1348,20 @@ _delete_argo_node() {
     
     _info "--- 删除 Argo 隧道节点 ---"
     
-    # 读取所有节点到数组
     local i=1
     local keys=()
     local names=()
     local ports=()
+    local cores=()
     
-    # 必须使用 while read 处理 process substitution 避免子 shell 问题
-    while IFS='|' read -r key name port; do
+    while IFS='|' read -r key name port core; do
         keys+=("$key")
         names+=("$name")
         ports+=("$port")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
+        cores+=("$core")
+        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port) [${core}]"
         ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
+    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.core // "sing-box")"' "$ARGO_METADATA_FILE")
     
     if [ ${#keys[@]} -eq 0 ]; then
          _warning "读取元数据失败。"
@@ -1386,14 +1382,22 @@ _delete_argo_node() {
     local selected_key="${keys[$idx]}"
     local selected_name="${names[$idx]}"
     local selected_port="${ports[$idx]}"
+    local selected_core="${cores[$idx]}"
     
     _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
     
     # 1. 停止该节点的隧道进程
     _stop_argo_tunnel "$selected_port"
     
-    # 2. 从 sing-box 配置文件中移除 inbound
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
+    # 2. 根据核心类型清理相应的配置文件
+    if [ "$selected_core" == "xray" ]; then
+        local xray_config="/usr/local/etc/xray/config.json"
+        local xray_meta="/usr/local/etc/xray/metadata.json"
+        [ -f "$xray_config" ] && _atomic_modify_json "$xray_config" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
+        [ -f "$xray_meta" ] && _atomic_modify_json "$xray_meta" "del(.\"$selected_key\")"
+    else
+        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
+    fi
     
     # 3. 删除 Argo 元数据
     jq "del(.\"$selected_key\")" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
@@ -1406,8 +1410,16 @@ _delete_argo_node() {
         _disable_argo_watchdog
     fi
 
-    # 6. 重启 sing-box
-    _manage_service "restart"
+    # 6. 重启对应服务
+    if [ "$selected_core" == "xray" ]; then
+        if command -v systemctl &>/dev/null && systemctl is-active xray &>/dev/null; then
+            systemctl restart xray
+        elif command -v rc-service &>/dev/null && rc-service xray status &>/dev/null; then
+            rc-service xray restart
+        fi
+    else
+        _manage_service "restart"
+    fi
     
     _success "节点 ${selected_name} 已删除！"
 }
@@ -1507,7 +1519,7 @@ _restart_argo_tunnel_menu() {
         paths+=("$path")
     done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token // "")|\(.value.uuid // "")|\(.value.password // "")|\(.value.path // "")"' "$ARGO_METADATA_FILE")
 
-    for i in "${!selected_indices[@]}"; do
+for i in "${!selected_indices[@]}"; do
         local idx="${selected_indices[$i]}"
         local tag="${tags[$idx]}"
         local name="${names[$idx]}"
@@ -1518,36 +1530,50 @@ _restart_argo_tunnel_menu() {
         local uuid="${uuids[$idx]}"
         local password="${passwords[$idx]}"
         local ws_path="${paths[$idx]}"
+        local enc_key=$(jq -r ".\"$tag\".enc_key // \"\"" "$ARGO_METADATA_FILE" 2>/dev/null)
+        local core=$(jq -r ".\"$tag\".core // \"sing-box\"" "$ARGO_METADATA_FILE" 2>/dev/null)
         
-        # 提取 protocol 简写用于 _start_argo_tunnel (vless/trojan)
         local proto_short="vless"
         [[ "$proto_full" == "trojan-ws" ]] && proto_short="trojan"
 
         _info "正在重启: $name (端口: $port)..."
         
-        # 停止
         _stop_argo_tunnel "$port"
         sleep 1
         
-        # 启动
         local new_domain=""
         if [ "$type" == "fixed" ]; then
-            if _start_argo_tunnel "$port" "$proto_short-ws" "$token"; then
+            if _start_argo_tunnel "$port" "$proto_short" "$token"; then
                  new_domain=$(jq -r ".\"$tag\".domain" "$ARGO_METADATA_FILE")
             else
                  _error "固定隧道重启失败: $name"
             fi
         else
-            new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
+            new_domain=$(_start_argo_tunnel "$port" "$proto_short")
             if [ -n "$new_domain" ]; then
                  _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
                  _success "更新临时域名: $new_domain"
                  
-                 # [同步链接] 临时域名变动，立即重新持久化链接
                  if [[ "$proto_full" == "vless-ws" ]]; then
                      _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$ws_path" >/dev/null
-                 else
+                 elif [[ "$proto_full" == "trojan-ws" ]]; then
                      _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$ws_path" >/dev/null
+                 elif [[ "$proto_full" == "vless-xhttp-enc" ]]; then
+                     local safe_name=$(_url_encode "$name")
+                     local safe_path=$(_url_encode "$ws_path")
+                     local safe_enc=$(_url_encode "$enc_key")
+                     local new_link="vless://${uuid}@${new_domain}:443?security=tls&encryption=${safe_enc}&flow=xtls-rprx-vision&sni=${new_domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${new_domain}#${safe_name}"
+                     
+                     _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".share_link = \"$new_link\""
+                     local xray_meta="/usr/local/etc/xray/metadata.json"
+                     [ -f "$xray_meta" ] && _atomic_modify_json "$xray_meta" ".\"$tag\".share_link = \"$new_link\""
+                     
+                     if [ -f "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ]; then
+                         export P_NAME="$name" P_HOST="$new_domain"
+                         _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .server) = env(P_HOST)'
+                         _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .servername) = env(P_HOST)'
+                         _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .["xhttp-opts"].host) = env(P_HOST)'
+                     fi
                  fi
             else
                  _error "临时隧道重启失败: $name"
@@ -1623,17 +1649,32 @@ _argo_keepalive() {
                  fi
             else
                  # 临时隧道
-                 local new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
+                 local new_domain=$(_start_argo_tunnel "$port" "$proto_short")
                  if [ -n "$new_domain" ]; then
-                      # 更新元数据
                       _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
                       logger "sing-box-watchdog: Temp tunnel $tag restarted with new domain: $new_domain"
                       
-                      # [同步链接] 临时域名变动，静默更新持久化链接
                       if [[ "$protocol" == "vless-ws" ]]; then
                           _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$path" >/dev/null
-                      else
+                      elif [[ "$protocol" == "trojan-ws" ]]; then
                           _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$path" >/dev/null
+                      elif [[ "$protocol" == "vless-xhttp-enc" ]]; then
+                          local enc_key=$(jq -r ".\"$tag\".enc_key // \"\"" "$ARGO_METADATA_FILE" 2>/dev/null)
+                          local safe_name=$(_url_encode "$name")
+                          local safe_path=$(_url_encode "$path")
+                          local safe_enc=$(_url_encode "$enc_key")
+                          local new_link="vless://${uuid}@${new_domain}:443?security=tls&encryption=${safe_enc}&flow=xtls-rprx-vision&sni=${new_domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${new_domain}#${safe_name}"
+                          
+                          _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".share_link = \"$new_link\""
+                          local xray_meta="/usr/local/etc/xray/metadata.json"
+                          [ -f "$xray_meta" ] && _atomic_modify_json "$xray_meta" ".\"$tag\".share_link = \"$new_link\""
+                          
+                          if [ -f "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ]; then
+                              export P_NAME="$name" P_HOST="$new_domain"
+                              _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .server) = env(P_HOST)'
+                              _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .servername) = env(P_HOST)'
+                              _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(P_NAME)) | .["xhttp-opts"].host) = env(P_HOST)'
+                          fi
                       fi
                  else
                       logger "sing-box-watchdog: Failed to restart temp tunnel $tag."
@@ -1789,8 +1830,9 @@ _sync_argo_early_data() {
     fi
 
     if [ -s "$ARGO_METADATA_FILE" ]; then
-        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link; do
+        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link core; do
             [ -z "$tag" ] && continue
+            [[ "$core" == "xray" ]] && continue
             [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
             [[ -z "$domain" || "$domain" == "null" ]] && continue
 
@@ -1814,7 +1856,7 @@ _sync_argo_early_data() {
                 _show_node_link "trojan-ws" "$name" "$domain" "443" "$tag" "$password" "$path" >/dev/null
                 links_updated=true
             fi
-        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
+        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // ""), (.value.core // "sing-box")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
     fi
 
     if [ "$config_updated" = true ]; then
