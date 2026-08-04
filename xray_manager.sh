@@ -3,7 +3,7 @@
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.1.0"
+XRAY_SCRIPT_VERSION="3.0.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -1052,7 +1052,7 @@ _add_trojan_grpc_tls() {
 }
 
 # ============================================================
-#    8. VLESS + XHTTP + ENC + Vision + TLS (支持CF回源, 高阶)
+#    8. VLESS + XHTTP + ENC + Vision + TLS (支持CF回源)
 # ============================================================
 
 _add_vless_xhttp_enc_vision_tls() {
@@ -1082,20 +1082,26 @@ _add_vless_xhttp_enc_vision_tls() {
     local enc_key=""
     local dec_key=""
     
-    # 尝试使用 JSON 输出解析，以便自动抓取 mlkem768 组合
-    local vlessenc_json=$($XRAY_BIN vlessenc --json 2>/dev/null)
-    if [ -n "$vlessenc_json" ] && echo "$vlessenc_json" | jq -e . >/dev/null 2>&1; then
-        enc_key=$(echo "$vlessenc_json" | jq -r '.mlkem768.encryption // .x25519.encryption // empty')
-        dec_key=$(echo "$vlessenc_json" | jq -r '.mlkem768.decryption // .x25519.decryption // empty')
-    else
-        # 回退至兼容版本的文本解析
-        local vlessenc_text=$($XRAY_BIN vlessenc 2>/dev/null)
-        enc_key=$(echo "$vlessenc_text" | grep -iE '^Encryption:' | head -n 1 | awk '{print $2}')
-        dec_key=$(echo "$vlessenc_text" | grep -iE '^Decryption:' | head -n 1 | awk '{print $2}')
+    # 获取原生输出（v26.x 默认输出为 JSON 格式，不再使用错误的 --json 参数）
+    local vlessenc_out=$($XRAY_BIN vlessenc 2>/dev/null)
+    
+    if [ -n "$vlessenc_out" ]; then
+        if echo "$vlessenc_out" | jq -e . >/dev/null 2>&1; then
+            # 优先提取 mlkem768（推荐的抗量子算法），若不存在则提取 x25519 或顶级域
+            enc_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.encryption // .x25519.encryption // .encryption // empty')
+            dec_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.decryption // .x25519.decryption // .decryption // empty')
+        else
+            # 应对未知的文本输出格式，用正则表达式精准提取密钥部分
+            enc_key=$(echo "$vlessenc_out" | grep -i 'encryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
+            dec_key=$(echo "$vlessenc_out" | grep -i 'decryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
+        fi
     fi
     
-    if [ -z "$enc_key" ] || [ -z "$dec_key" ]; then
+    # 检测变量是否有效（排除空值或字符串"null"）
+    if [ -z "$enc_key" ] || [ -z "$dec_key" ] || [ "$enc_key" == "null" ]; then
         _error "VLESS Encryption 密钥生成失败！请确保您的 Xray-core 版本支持 'xray vlessenc' 命令。"
+        echo -e "${YELLOW}xray vlessenc 原始输出如下：${NC}" >&2
+        $XRAY_BIN vlessenc >&2
         return 1
     fi
     
