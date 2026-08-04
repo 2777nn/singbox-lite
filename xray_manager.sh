@@ -1179,11 +1179,11 @@ _add_vless_xhttp_enc_vision_tls() {
 
 
 # ============================================================
-#       9. VLESS + XHTTP + ENC + Vision + TLS (Argo隧道)
+#       9. VLESS + WS + ENC + Vision + TLS (Argo隧道)
 # ============================================================
 
-_add_xray_argo_vless_xhttp_enc() {
-    _info "--- 创建 Xray VLESS + XHTTP + ENC + Vision + Argo 节点 ---"
+_add_xray_argo_vless_ws_enc() {
+    _info "--- 创建 Xray VLESS + WS + ENC + Vision + TLS (Argo隧道) 节点 ---"
 
     _install_cloudflared || return 1
 
@@ -1202,12 +1202,12 @@ _add_xray_argo_vless_xhttp_enc() {
         fi
     done
 
-    read -p "请输入 XHTTP 路径 (回车随机生成): " xhttp_path
-    if [ -z "$xhttp_path" ]; then
-        xhttp_path="/xhttp-"$(openssl rand -hex 4)
-        _info "已生成随机路径: ${xhttp_path}"
+    read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
+    if [ -z "$ws_path" ]; then
+        ws_path="/ws-"$(openssl rand -hex 4)
+        _info "已生成随机路径: ${ws_path}"
     else
-        [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
+        [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
     fi
 
     echo ""
@@ -1242,7 +1242,7 @@ _add_xray_argo_vless_xhttp_enc() {
         _info "您选择了 [临时隧道] 模式。"
     fi
 
-    local default_name="Argo-X-VLESS-XHTTP-${port}"
+    local default_name="Argo-X-VLESS-WS-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
 
@@ -1254,16 +1254,13 @@ _add_xray_argo_vless_xhttp_enc() {
     local enc_key="" dec_key=""
     if [ -n "$vlessenc_out" ]; then
         if echo "$vlessenc_out" | jq -e . >/dev/null 2>&1; then
-            # 如果是 JSON 格式
             enc_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.encryption // .x25519.encryption // .encryption // empty')
             dec_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.decryption // .x25519.decryption // .decryption // empty')
         else
-            # 如果是文本格式，用正则表达式精准提取
             enc_key=$(echo "$vlessenc_out" | grep -i 'encryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
             dec_key=$(echo "$vlessenc_out" | grep -i 'decryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
         fi
     fi
-    
     if [ -z "$enc_key" ] || [ -z "$dec_key" ] || [ "$enc_key" == "null" ]; then
         _error "密钥生成失败，请确认 Xray 支持 'xray vlessenc'。"
         echo -e "${YELLOW}xray vlessenc 原始输出如下：${NC}" >&2
@@ -1271,9 +1268,10 @@ _add_xray_argo_vless_xhttp_enc() {
         return 1
     fi
 
-    local tag="xray-argo-vless-xhttp-${port}"
+    local tag="xray-argo-vless-ws-${port}"
+    # 替换为 WebSocket 的 inbound 结构
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" \
-        --arg pa "$xhttp_path" --arg dec "$dec_key" \
+        --arg pa "$ws_path" --arg dec "$dec_key" \
         '{
             tag: $tag,
             listen: "127.0.0.1",
@@ -1284,10 +1282,9 @@ _add_xray_argo_vless_xhttp_enc() {
                 decryption: $dec
             },
             streamSettings: {
-                network: "xhttp",
+                network: "ws",
                 security: "none",
-                xhttpSettings: {
-                    mode: "stream-one",
+                wsSettings: {
                     path: $pa
                 }
             }
@@ -1316,11 +1313,13 @@ _add_xray_argo_vless_xhttp_enc() {
     fi
 
     local safe_name=$(_url_encode "$name")
-    local safe_path=$(_url_encode "$xhttp_path")
+    local safe_path=$(_url_encode "$ws_path")
     local safe_enc=$(_url_encode "$enc_key")
-    local share_link="vless://${uuid}@${tunnel_domain}:443?security=tls&encryption=${safe_enc}&flow=${flow}&sni=${tunnel_domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${tunnel_domain}#${safe_name}"
+    
+    # 构建标准的 WS 分享链接
+    local share_link="vless://${uuid}@${tunnel_domain}:443?security=tls&encryption=${safe_enc}&flow=${flow}&sni=${tunnel_domain}&type=ws&path=${safe_path}&host=${tunnel_domain}#${safe_name}"
 
-    # 保存元数据到 argo_metadata.json
+    # 保存元数据到 argo_metadata.json (修改 protocol 为 vless-ws-enc)
     local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
     [ ! -f "$argo_meta_file" ] && echo '{}' > "$argo_meta_file"
     local argo_meta=$(jq -n \
@@ -1329,29 +1328,29 @@ _add_xray_argo_vless_xhttp_enc() {
         --arg domain "$tunnel_domain" \
         --arg port "$port" \
         --arg uuid "$uuid" \
-        --arg path "$xhttp_path" \
+        --arg path "$ws_path" \
         --arg enc "$enc_key" \
         --arg link "$share_link" \
         --arg type "$argo_type" \
         --arg token "$token" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), uuid: $uuid, path: $path, enc_key: $enc, protocol: "vless-xhttp-enc", type: $type, token: $token, core: "xray", share_link: $link, created_at: $created}}')
+        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), uuid: $uuid, path: $path, enc_key: $enc, protocol: "vless-ws-enc", type: $type, token: $token, core: "xray", share_link: $link, created_at: $created}}')
     _atomic_modify_json "$argo_meta_file" ". + $argo_meta"
 
     _save_xray_meta "$tag" "$name" "$share_link"
 
-    # 同步 Clash YAML
+    # 同步 Clash YAML (更改 network 为 ws)
     local proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" \
-        --arg pa "$xhttp_path" --arg f "$flow" --arg enc "$enc_key" \
+        --arg pa "$ws_path" --arg f "$flow" --arg enc "$enc_key" \
         '{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:$f, tls:true, servername:$s,
-          "skip-cert-verify":false, network:"xhttp", encryption:$enc,
-          "xhttp-opts":{mode:"stream-one", path:$pa, host:$s, headers:{Host:[$s]}}}')
+          "skip-cert-verify":false, network:"ws", encryption:$enc,
+          "ws-opts":{path:$pa, headers:{Host:[$s]}}}')
     _add_node_to_yaml "$proxy_json"
 
     _enable_argo_watchdog
 
     echo ""
-    _success "Xray VLESS+XHTTP+ENC+Vision+Argo 节点创建成功!"
+    _success "Xray VLESS+WS+ENC+Vision+TLS(Argo隧道) 节点创建成功!"
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
     echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
@@ -1702,7 +1701,7 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[7]${NC} Trojan+gRPC+TLS"
         echo -e "  ${YELLOW}[8]${NC} VLESS+XHTTP+ENC+Vision+TLS (H2回源)"
         echo -e "  ${CYAN}  ── Argo 隧道协议 ──${NC}"
-        echo -e "  ${YELLOW}[9]${NC} VLESS+XHTTP+ENC+Vision+TLS (Argo隧道)"
+        echo -e "  ${YELLOW}[9]${NC} VLESS+WS+ENC+Vision+TLS (Argo隧道)"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
         echo -e "  ${YELLOW}[10]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
@@ -1721,7 +1720,7 @@ _xray_add_node_menu() {
             6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
             7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
             8) _add_vless_xhttp_enc_vision_tls && _manage_xray_service "restart" ;;
-            9) _add_xray_argo_vless_xhttp_enc && _manage_xray_service "restart" ;;
+            9) _add_xray_argo_vless_ws_enc && _manage_xray_service "restart" ;;
             10) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
             0) return ;;
             *) _error "无效输入" ;;
