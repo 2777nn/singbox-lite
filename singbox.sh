@@ -5312,7 +5312,7 @@ _xray_features() {
     
     if [ -f "$script_path" ]; then
         chmod +x "$script_path"
-        source "$script_path"
+        bash "$script_path"
     else
         _error "找不到 Xray 管理脚本: ${script_path}"
     fi
