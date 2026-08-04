@@ -461,6 +461,15 @@ _uninstall_xray() {
         return
     fi
     
+    # 停止属于 Xray 的 Argo 隧道进程
+    local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
+    if [ -f "$argo_meta_file" ]; then
+        jq -r 'to_entries[] | select(.value.core == "xray") | "\(.key)|\(.value.local_port)"' "$argo_meta_file" 2>/dev/null | while IFS='|' read -r atag aport; do
+            [ -n "$aport" ] && _stop_argo_tunnel "$aport"
+            _atomic_modify_json "$argo_meta_file" "del(.\"$atag\")" 2>/dev/null
+        done
+    fi
+
     # 停止服务
     _manage_xray_service "stop"
     
@@ -1169,8 +1178,181 @@ _add_vless_xhttp_enc_vision_tls() {
     fi
 }
 
+
 # ============================================================
-#                   9. Shadowsocks
+#       9. VLESS + XHTTP + ENC + Vision + TLS (Argo隧道)
+# ============================================================
+
+_add_xray_argo_vless_xhttp_enc() {
+    _info "--- 创建 Xray VLESS + XHTTP + ENC + Vision + Argo 节点 ---"
+
+    _install_cloudflared || return 1
+
+    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
+    local port="$input_port"
+
+    while true; do
+        if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+            _check_xray_port_conflict "$port" && port="" && continue
+            _info "已使用监听端口: ${port}"
+            break
+        else
+            [ -n "$port" ] && _warn "端口格式无效，将重新生成..."
+            port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
+            _info "分配随机端口: ${port}..."
+        fi
+    done
+
+    read -p "请输入 XHTTP 路径 (回车随机生成): " xhttp_path
+    if [ -z "$xhttp_path" ]; then
+        xhttp_path="/xhttp-"$(openssl rand -hex 4)
+        _info "已生成随机路径: ${xhttp_path}"
+    else
+        [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
+    fi
+
+    echo ""
+    echo "请选择隧道模式:"
+    echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定)"
+    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久)"
+    read -p "请选择 [1/2] (默认: 1): " tunnel_mode
+    tunnel_mode=${tunnel_mode:-1}
+
+    local token=""
+    local tunnel_domain=""
+    local argo_type="temp"
+
+    if [ "$tunnel_mode" == "2" ]; then
+        argo_type="fixed"
+        _info "您选择了 [固定隧道] 模式。"
+        read -p "Token: " input_token
+        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
+        [ -z "$token" ] && token="$input_token"
+        [ -z "$token" ] && { _error "Token 不能为空"; return 1; }
+
+        read -p "域名 (例如 tunnel.example.com): " input_domain
+        [ -z "$input_domain" ] && { _error "域名不能为空"; return 1; }
+        tunnel_domain="$input_domain"
+
+        echo ""
+        _info "【提示】请确保已在 CF 配置 Public Hostname:"
+        _info "  Public Hostname: ${tunnel_domain} -> http://localhost:${port}"
+        read -n 1 -s -r -p "按任意键继续..."
+        echo ""
+    else
+        _info "您选择了 [临时隧道] 模式。"
+    fi
+
+    local default_name="Argo-X-VLESS-XHTTP-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+
+    local uuid=$($XRAY_BIN uuid)
+    local flow="xtls-rprx-vision"
+    
+    _info "正在生成 VLESS Encryption 密钥..."
+    local vlessenc_out=$($XRAY_BIN vlessenc 2>/dev/null)
+    local enc_key="" dec_key=""
+    if [ -n "$vlessenc_out" ]; then
+        if echo "$vlessenc_out" | jq -e . >/dev/null 2>&1; then
+            enc_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.encryption // .x25519.encryption // .encryption // empty')
+            dec_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.decryption // .x25519.decryption // .decryption // empty')
+        fi
+    fi
+    [ -z "$enc_key" ] || [ -z "$dec_key" ] || [ "$enc_key" == "null" ] && { _error "密钥生成失败，请确认 Xray 支持 'xray vlessenc'。"; return 1; }
+
+    local tag="xray-argo-vless-xhttp-${port}"
+    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" \
+        --arg pa "$xhttp_path" --arg dec "$dec_key" \
+        '{
+            tag: $tag,
+            listen: "127.0.0.1",
+            port: $port,
+            protocol: "vless",
+            settings: {
+                clients: [{id: $uuid, flow: $flow}],
+                decryption: $dec
+            },
+            streamSettings: {
+                network: "xhttp",
+                security: "none",
+                xhttpSettings: {
+                    mode: "stream-one",
+                    path: $pa
+                }
+            }
+        }')
+
+    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+
+    _manage_xray_service "restart"
+    sleep 2
+
+    if [ "$argo_type" == "fixed" ]; then
+        if ! _start_argo_tunnel "$port" "vless" "$token"; then
+             _atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$tag\"))"
+             _manage_xray_service "restart"
+             return 1
+        fi
+    else
+        local real_domain=$(_start_argo_tunnel "$port" "vless")
+        if [ -z "$real_domain" ]; then
+            _error "隧道启动失败，解绑配置..."
+            _atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$tag\"))"
+            _manage_xray_service "restart"
+            return 1
+        fi
+        tunnel_domain="$real_domain"
+    fi
+
+    local safe_name=$(_url_encode "$name")
+    local safe_path=$(_url_encode "$xhttp_path")
+    local safe_enc=$(_url_encode "$enc_key")
+    local share_link="vless://${uuid}@${tunnel_domain}:443?security=tls&encryption=${safe_enc}&flow=${flow}&sni=${tunnel_domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${tunnel_domain}#${safe_name}"
+
+    # 保存元数据到 argo_metadata.json
+    local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
+    [ ! -f "$argo_meta_file" ] && echo '{}' > "$argo_meta_file"
+    local argo_meta=$(jq -n \
+        --arg tag "$tag" \
+        --arg name "$name" \
+        --arg domain "$tunnel_domain" \
+        --arg port "$port" \
+        --arg uuid "$uuid" \
+        --arg path "$xhttp_path" \
+        --arg enc "$enc_key" \
+        --arg link "$share_link" \
+        --arg type "$argo_type" \
+        --arg token "$token" \
+        --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
+        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), uuid: $uuid, path: $path, enc_key: $enc, protocol: "vless-xhttp-enc", type: $type, token: $token, core: "xray", share_link: $link, created_at: $created}}')
+    _atomic_modify_json "$argo_meta_file" ". + $argo_meta"
+
+    _save_xray_meta "$tag" "$name" "$share_link"
+
+    # 同步 Clash YAML
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" \
+        --arg pa "$xhttp_path" --arg f "$flow" --arg enc "$enc_key" \
+        '{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:$f, tls:true, servername:$s,
+          "skip-cert-verify":false, network:"xhttp", encryption:$enc,
+          "xhttp-opts":{mode:"stream-one", path:$pa, host:$s, headers:{Host:[$s]}}}')
+    _add_node_to_yaml "$proxy_json"
+
+    _enable_argo_watchdog
+
+    echo ""
+    _success "Xray VLESS+XHTTP+ENC+Vision+Argo 节点创建成功!"
+    echo "-------------------------------------------"
+    echo -e "节点名称: ${GREEN}${name}${NC}"
+    echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
+    echo -e "本地端口: ${port}"
+    echo -e "${YELLOW}分享链接:${NC} ${share_link}"
+    echo "-------------------------------------------"
+}
+
+
+# ============================================================
+#                   10. Shadowsocks
 # ============================================================
 
 _add_shadowsocks_xray() {
@@ -1342,9 +1524,18 @@ _delete_xray_node() {
         _error "无效选择！"; return
     fi
     local target_tag="${tags[$((choice-1))]}"
+    local target_port="${ports[$((choice-1))]}"
     local target_name="${names[$((choice-1))]}"
     read -p "$(echo -e ${RED}"确定删除 [$target_name]? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
+    
+    # 停止关联的 Argo 隧道 (如果有)
+    local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
+    if [ -f "$argo_meta_file" ] && jq -e ".\"$target_tag\"" "$argo_meta_file" >/dev/null 2>&1; then
+        _stop_argo_tunnel "$target_port"
+        _atomic_modify_json "$argo_meta_file" "del(.\"$target_tag\")"
+    fi
+
     [ -n "$target_name" ] && [ "$target_name" != "null" ] && _remove_node_from_yaml "$target_name"
     rm -f "${XRAY_DIR}/${target_tag}.pem" "${XRAY_DIR}/${target_tag}.key" 2>/dev/null
     _atomic_modify_json "$XRAY_CONFIG" "del(.inbounds[] | select(.tag == \"$target_tag\"))"
@@ -1446,6 +1637,37 @@ _modify_xray_port() {
             mv "$tmp" "$XRAY_METADATA" || rm -f "$tmp"
     fi
     
+    local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
+    if [ -f "$argo_meta_file" ] && jq -e ".\"$target_tag\"" "$argo_meta_file" >/dev/null 2>&1; then
+        local token=$(jq -r ".\"$target_tag\".token // \"\"" "$argo_meta_file")
+        local argo_type=$(jq -r ".\"$target_tag\".type // \"temp\"" "$argo_meta_file")
+        
+        _stop_argo_tunnel "$old_port"
+        sleep 1
+        
+        local new_domain=""
+        if [ "$argo_type" == "fixed" ]; then
+            _start_argo_tunnel "$new_port" "vless" "$token"
+            new_domain=$(jq -r ".\"$target_tag\".domain" "$argo_meta_file")
+        else
+            new_domain=$(_start_argo_tunnel "$new_port" "vless")
+        fi
+        
+        if [ -n "$new_domain" ]; then
+            local uuid=$(jq -r ".\"$target_tag\".uuid // \"\"" "$argo_meta_file")
+            local xpath=$(jq -r ".\"$target_tag\".path // \"\"" "$argo_meta_file")
+            local enc_key=$(jq -r ".\"$target_tag\".enc_key // \"\"" "$argo_meta_file")
+            local safe_name=$(_url_encode "$new_name")
+            local safe_path=$(_url_encode "$xpath")
+            local safe_enc=$(_url_encode "$enc_key")
+            local updated_link="vless://${uuid}@${new_domain}:443?security=tls&encryption=${safe_enc}&flow=xtls-rprx-vision&sni=${new_domain}&type=xhttp&mode=stream-one&path=${safe_path}&host=${new_domain}#${safe_name}"
+            
+            local tmp_argo="${argo_meta_file}.tmp.$$"
+            jq --arg ot "$target_tag" --arg nt "$new_tag" --arg np "$new_port" --arg d "$new_domain" --arg l "$updated_link" --arg n "$new_name" \
+                '. + {($nt): (.[$ot] + {name: $n, local_port: ($np|tonumber), domain: $d, share_link: $l})} | del(.[$ot])' "$argo_meta_file" > "$tmp_argo" 2>/dev/null && mv "$tmp_argo" "$argo_meta_file"
+        fi
+    fi
+
     _manage_xray_service "restart"
     _success "节点 [$new_name] 端口已改为 ${new_port}！"
 }
@@ -1470,11 +1692,13 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[6]${NC} VLESS+gRPC+TLS"
         echo -e "  ${YELLOW}[7]${NC} Trojan+gRPC+TLS"
         echo -e "  ${YELLOW}[8]${NC} VLESS+XHTTP+ENC+Vision+TLS (H2回源)"
+        echo -e "  ${CYAN}  ── Argo 隧道协议 ──${NC}"
+        echo -e "  ${YELLOW}[9]${NC} VLESS+XHTTP+ENC+Vision+TLS (Argo隧道)"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
-        echo -e "  ${YELLOW}[9]${NC} Shadowsocks"
+        echo -e "  ${YELLOW}[10]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
         echo "  ==============================="
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         if [ "$choice" != "0" ] && [ ! -f "$XRAY_BIN" ]; then
             _error "Xray 尚未安装！请先安装 Xray 核心。"
             read -p "按回车键返回..."; continue
@@ -1488,7 +1712,8 @@ _xray_add_node_menu() {
             6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
             7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
             8) _add_vless_xhttp_enc_vision_tls && _manage_xray_service "restart" ;;
-            9) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
+            9) _add_xray_argo_vless_xhttp_enc ;;
+            10) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
