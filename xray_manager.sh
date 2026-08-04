@@ -3,7 +3,7 @@
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="3.0.0"
+XRAY_SCRIPT_VERSION="3.1.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -795,8 +795,376 @@ _add_trojan_grpc_reality() {
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
 }
 
+
 # ============================================================
-#                   5. Shadowsocks
+#                 自签证书生成 (CF回源用)
+# ============================================================
+# 注意: CF回源协议复用上方定义的 _generate_xray_cert，不再重复定义
+
+# ============================================================
+#         5. VLESS + HTTP/2 + TLS (支持CF回源)
+# ============================================================
+
+_add_vless_h2_tls() {
+    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    local node_ip="$server_ip"
+    
+    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
+    node_ip=${custom_ip:-$server_ip}
+    
+    local port=$(_input_port)
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
+    
+    local path="/$(openssl rand -hex 6)"
+    read -p "请输入 H2 路径 (默认: ${path}): " custom_path
+    path=${custom_path:-$path}
+    
+    local default_name="X-VLESS-H2-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    local uuid=$($XRAY_BIN uuid)
+    local tag="xray-vless-h2-${port}"
+    local cert_path="${XRAY_DIR}/${tag}.pem"
+    local key_path="${XRAY_DIR}/${tag}.key"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    # 生成自签证书
+    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
+    
+    # 构建 inbound (Xray v26+ 旧h2已迁移至 XHTTP stream-one)
+    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
+        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg pa "$path" \
+        '{
+            tag: $tag,
+            listen: "::",
+            port: $port,
+            protocol: "vless",
+            settings: {
+                clients: [{id: $uuid, flow: ""}],
+                decryption: "none"
+            },
+            streamSettings: {
+                network: "xhttp",
+                security: "tls",
+                tlsSettings: {
+                    certificates: [{certificateFile: $cert, keyFile: $key}],
+                    alpn: ["h2"]
+                },
+                xhttpSettings: {
+                    mode: "stream-one",
+                    host: $sn,
+                    path: $pa
+                }
+            }
+        }')
+    
+    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    
+    _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点建议使用 V2rayN/Xray 等原生客户端"
+    
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param="&insecure=1"
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
+    
+    _save_xray_meta "$tag" "$name" "$link"
+    
+    _info "此节点支持 CF CDN 回源 (SSL模式设为 Full)"
+    _success "VLESS+H2+TLS 节点 [${name}] 添加成功！"
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
+}
+
+# ============================================================
+#         6. VLESS + gRPC + TLS (支持CF回源)
+# ============================================================
+
+_add_vless_grpc_tls() {
+    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    local node_ip="$server_ip"
+    
+    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
+    node_ip=${custom_ip:-$server_ip}
+    
+    local port=$(_input_port)
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
+    
+    local service_name="grpc-$(openssl rand -hex 4)"
+    read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
+    service_name=${custom_svc:-$service_name}
+    
+    local default_name="X-VLESS-gRPC-TLS-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    local uuid=$($XRAY_BIN uuid)
+    local tag="xray-vless-grpc-tls-${port}"
+    local cert_path="${XRAY_DIR}/${tag}.pem"
+    local key_path="${XRAY_DIR}/${tag}.key"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
+    
+    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
+        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
+        '{
+            tag: $tag,
+            listen: "::",
+            port: $port,
+            protocol: "vless",
+            settings: {
+                clients: [{id: $uuid, flow: ""}],
+                decryption: "none"
+            },
+            streamSettings: {
+                network: "grpc",
+                security: "tls",
+                tlsSettings: {
+                    certificates: [{certificateFile: $cert, keyFile: $key}],
+                    alpn: ["h2"]
+                },
+                grpcSettings: {
+                    serviceName: $svc
+                }
+            }
+        }')
+    
+    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
+        --arg sn "$sni" --arg svc "$service_name" \
+        '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, tls:true, servername:$sn,
+          "skip-cert-verify":true, network:"grpc",
+          "grpc-opts":{"grpc-service-name":$svc}}')
+    _add_node_to_yaml "$proxy_json"
+    
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param="&insecure=1"
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
+    
+    _save_xray_meta "$tag" "$name" "$link"
+    
+    _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
+    _success "VLESS+gRPC+TLS 节点 [${name}] 添加成功！"
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
+}
+
+# ============================================================
+#         7. Trojan + gRPC + TLS (支持CF回源)
+# ============================================================
+
+_add_trojan_grpc_tls() {
+    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    local node_ip="$server_ip"
+    
+    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
+    node_ip=${custom_ip:-$server_ip}
+    
+    local port=$(_input_port)
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
+    
+    local service_name="grpc-$(openssl rand -hex 4)"
+    read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
+    service_name=${custom_svc:-$service_name}
+    
+    local default_name="X-Trojan-gRPC-TLS-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    local password=$(openssl rand -hex 16)
+    local tag="xray-trojan-grpc-tls-${port}"
+    local cert_path="${XRAY_DIR}/${tag}.pem"
+    local key_path="${XRAY_DIR}/${tag}.key"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
+    
+    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg pw "$password" \
+        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
+        '{
+            tag: $tag,
+            listen: "::",
+            port: $port,
+            protocol: "trojan",
+            settings: {
+                clients: [{password: $pw}]
+            },
+            streamSettings: {
+                network: "grpc",
+                security: "tls",
+                tlsSettings: {
+                    certificates: [{certificateFile: $cert, keyFile: $key}],
+                    alpn: ["h2"]
+                },
+                grpcSettings: {
+                    serviceName: $svc
+                }
+            }
+        }')
+    
+    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg pw "$password" \
+        --arg sn "$sni" --arg svc "$service_name" \
+        '{name:$n, type:"trojan", server:$s, port:$p, password:$pw, udp:true,
+          sni:$sn, "skip-cert-verify":true, network:"grpc",
+          "grpc-opts":{"grpc-service-name":$svc}}')
+    _add_node_to_yaml "$proxy_json"
+    
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param="&insecure=1"
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+    
+    _save_xray_meta "$tag" "$name" "$link"
+    
+    _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
+    _success "Trojan+gRPC+TLS 节点 [${name}] 添加成功！"
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
+}
+
+# ============================================================
+#    8. VLESS + XHTTP + ENC + Vision + TLS (支持CF回源, 高阶)
+# ============================================================
+
+_add_vless_xhttp_enc_vision_tls() {
+    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    local node_ip="$server_ip"
+    
+    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
+    node_ip=${custom_ip:-$server_ip}
+    
+    local port=$(_input_port)
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
+    
+    local path="/$(openssl rand -hex 6)"
+    read -p "请输入 XHTTP 路径 (默认: ${path}): " custom_path
+    path=${custom_path:-$path}
+    
+    local default_name="X-VLESS-XHTTP-ENC-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    local uuid=$($XRAY_BIN uuid)
+    local flow="xtls-rprx-vision"
+    
+    _info "正在生成 VLESS Encryption 密钥 (需依赖 Xray-core >= v26.2.6)..."
+    local enc_key=""
+    local dec_key=""
+    
+    # 尝试使用 JSON 输出解析，以便自动抓取 mlkem768 组合
+    local vlessenc_json=$($XRAY_BIN vlessenc --json 2>/dev/null)
+    if [ -n "$vlessenc_json" ] && echo "$vlessenc_json" | jq -e . >/dev/null 2>&1; then
+        enc_key=$(echo "$vlessenc_json" | jq -r '.mlkem768.encryption // .x25519.encryption // empty')
+        dec_key=$(echo "$vlessenc_json" | jq -r '.mlkem768.decryption // .x25519.decryption // empty')
+    else
+        # 回退至兼容版本的文本解析
+        local vlessenc_text=$($XRAY_BIN vlessenc 2>/dev/null)
+        enc_key=$(echo "$vlessenc_text" | grep -iE '^Encryption:' | head -n 1 | awk '{print $2}')
+        dec_key=$(echo "$vlessenc_text" | grep -iE '^Decryption:' | head -n 1 | awk '{print $2}')
+    fi
+    
+    if [ -z "$enc_key" ] || [ -z "$dec_key" ]; then
+        _error "VLESS Encryption 密钥生成失败！请确保您的 Xray-core 版本支持 'xray vlessenc' 命令。"
+        return 1
+    fi
+    
+    local tag="xray-vless-xhttp-enc-${port}"
+    local cert_path="${XRAY_DIR}/${tag}.pem"
+    local key_path="${XRAY_DIR}/${tag}.key"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
+    
+    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" \
+        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg pa "$path" --arg dec "$dec_key" \
+        '{
+            tag: $tag,
+            listen: "::",
+            port: $port,
+            protocol: "vless",
+            settings: {
+                clients: [{id: $uuid, flow: $flow}],
+                decryption: $dec
+            },
+            streamSettings: {
+                network: "xhttp",
+                security: "tls",
+                tlsSettings: {
+                    certificates: [{certificateFile: $cert, keyFile: $key}],
+                    alpn: ["h2"]
+                },
+                xhttpSettings: {
+                    mode: "stream-one",
+                    host: $sn,
+                    path: $pa
+                }
+            }
+        }')
+    
+    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    
+    _warn "mihomo/Clash 对 XHTTP、VLESS-ENC 组合的支持可能不完善，如有断流请建议首选 V2rayN/Xray 客户端"
+    
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
+        --arg sn "$sni" --arg pa "$path" --arg f "$flow" --arg enc "$enc_key" \
+        '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, flow:$f, tls:true, servername:$sn,
+          "skip-cert-verify":true, network:"xhttp", encryption:$enc,
+          "xhttp-opts":{mode:"stream-one", path:$pa, host:$sn, headers:{Host:[$sn]}}}')
+    _add_node_to_yaml "$proxy_json"
+    
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param="&insecure=1"
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=$(_url_encode "$enc_key")&flow=${flow}&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
+    
+    _save_xray_meta "$tag" "$name" "$link"
+    
+    _info "此节点支持 CF CDN 回源 (需开启小云朵，并将 SSL/TLS 模式设为 Full/Strict)"
+    _success "VLESS+XHTTP+ENC+Vision+TLS 节点 [${name}] 添加成功！"
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
+}
+
+# ============================================================
+#                   9. Shadowsocks
 # ============================================================
 
 _add_shadowsocks_xray() {
@@ -891,262 +1259,6 @@ _add_shadowsocks_xray() {
     
     _success "Shadowsocks (${method}) 节点 [${name}] 添加成功！"
     echo -e "  ${YELLOW}分享链接:${NC} ${link}"
-}
-
-# ============================================================
-#                 自签证书生成 (CF回源用)
-# ============================================================
-# 注意: CF回源协议复用上方第160行定义的 _generate_xray_cert，不再重复定义
-
-# ============================================================
-#         6. VLESS + HTTP/2 + TLS (支持CF回源)
-# ============================================================
-
-_add_vless_h2_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
-    local node_ip="$server_ip"
-    
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
-    
-    local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
-    
-    local path="/$(openssl rand -hex 6)"
-    read -p "请输入 H2 路径 (默认: ${path}): " custom_path
-    path=${custom_path:-$path}
-    
-    local default_name="X-VLESS-H2-${port}"
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name=${custom_name:-$default_name}
-    
-    local uuid=$($XRAY_BIN uuid)
-    local tag="xray-vless-h2-${port}"
-    local cert_path="${XRAY_DIR}/${tag}.pem"
-    local key_path="${XRAY_DIR}/${tag}.key"
-    local yaml_ip="$node_ip"
-    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    # 生成自签证书
-    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
-    
-    # 构建 inbound (Xray v26+ 旧h2已迁移至 XHTTP stream-one)
-    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
-        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg pa "$path" \
-        '{
-            tag: $tag,
-            listen: "::",
-            port: $port,
-            protocol: "vless",
-            settings: {
-                clients: [{id: $uuid, flow: ""}],
-                decryption: "none"
-            },
-            streamSettings: {
-                network: "xhttp",
-                security: "tls",
-                tlsSettings: {
-                    certificates: [{certificateFile: $cert, keyFile: $key}],
-                    alpn: ["h2"]
-                },
-                xhttpSettings: {
-                    mode: "stream-one",
-                    host: $sn,
-                    path: $pa
-                }
-            }
-        }')
-    
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
-    
-    # Clash YAML - mihomo 不支持 XHTTP，跳过写入
-    _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点仅支持 V2rayN/Xray 客户端"
-    
-    local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
-    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
-    
-    _save_xray_meta "$tag" "$name" "$link"
-    
-    _info "此节点支持 CF CDN 回源 (SSL模式设为 Full)"
-    _success "VLESS+H2+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
-    if [ "$clean_link" != "$link" ]; then
-        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
-        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
-    else
-        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
-    fi
-}
-
-# ============================================================
-#         7. VLESS + gRPC + TLS (支持CF回源)
-# ============================================================
-
-_add_vless_grpc_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
-    local node_ip="$server_ip"
-    
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
-    
-    local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
-    
-    local service_name="grpc-$(openssl rand -hex 4)"
-    read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
-    service_name=${custom_svc:-$service_name}
-    
-    local default_name="X-VLESS-gRPC-TLS-${port}"
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name=${custom_name:-$default_name}
-    
-    local uuid=$($XRAY_BIN uuid)
-    local tag="xray-vless-grpc-tls-${port}"
-    local cert_path="${XRAY_DIR}/${tag}.pem"
-    local key_path="${XRAY_DIR}/${tag}.key"
-    local yaml_ip="$node_ip"
-    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
-    
-    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
-        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
-        '{
-            tag: $tag,
-            listen: "::",
-            port: $port,
-            protocol: "vless",
-            settings: {
-                clients: [{id: $uuid, flow: ""}],
-                decryption: "none"
-            },
-            streamSettings: {
-                network: "grpc",
-                security: "tls",
-                tlsSettings: {
-                    certificates: [{certificateFile: $cert, keyFile: $key}],
-                    alpn: ["h2"]
-                },
-                grpcSettings: {
-                    serviceName: $svc
-                }
-            }
-        }')
-    
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
-    
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
-        --arg sn "$sni" --arg svc "$service_name" \
-        '{name:$n, type:"vless", server:$s, port:$p, uuid:$u, tls:true, servername:$sn,
-          "skip-cert-verify":true, network:"grpc",
-          "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
-    
-    local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
-    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
-    
-    _save_xray_meta "$tag" "$name" "$link"
-    
-    _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
-    _success "VLESS+gRPC+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
-    if [ "$clean_link" != "$link" ]; then
-        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
-        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
-    else
-        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
-    fi
-}
-
-# ============================================================
-#         8. Trojan + gRPC + TLS (支持CF回源)
-# ============================================================
-
-_add_trojan_grpc_tls() {
-    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
-    local node_ip="$server_ip"
-    
-    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
-    node_ip=${custom_ip:-$server_ip}
-    
-    local port=$(_input_port)
-    local sni="www.amd.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
-    sni=${custom_sni:-www.amd.com}
-    
-    local service_name="grpc-$(openssl rand -hex 4)"
-    read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
-    service_name=${custom_svc:-$service_name}
-    
-    local default_name="X-Trojan-gRPC-TLS-${port}"
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name=${custom_name:-$default_name}
-    
-    local password=$(openssl rand -hex 16)
-    local tag="xray-trojan-grpc-tls-${port}"
-    local cert_path="${XRAY_DIR}/${tag}.pem"
-    local key_path="${XRAY_DIR}/${tag}.key"
-    local yaml_ip="$node_ip"
-    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
-    
-    local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg pw "$password" \
-        --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
-        '{
-            tag: $tag,
-            listen: "::",
-            port: $port,
-            protocol: "trojan",
-            settings: {
-                clients: [{password: $pw}]
-            },
-            streamSettings: {
-                network: "grpc",
-                security: "tls",
-                tlsSettings: {
-                    certificates: [{certificateFile: $cert, keyFile: $key}],
-                    alpn: ["h2"]
-                },
-                grpcSettings: {
-                    serviceName: $svc
-                }
-            }
-        }')
-    
-    _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
-    
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg pw "$password" \
-        --arg sn "$sni" --arg svc "$service_name" \
-        '{name:$n, type:"trojan", server:$s, port:$p, password:$pw, udp:true,
-          sni:$sn, "skip-cert-verify":true, network:"grpc",
-          "grpc-opts":{"grpc-service-name":$svc}}')
-    _add_node_to_yaml "$proxy_json"
-    
-    local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param="&insecure=1"
-    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
-    local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
-    
-    _save_xray_meta "$tag" "$name" "$link"
-    
-    _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
-    _success "Trojan+gRPC+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
-    if [ "$clean_link" != "$link" ]; then
-        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
-        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
-    else
-        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
-    fi
 }
 
 # ============================================================
@@ -1351,11 +1463,12 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[5]${NC} VLESS+XHTTP+TLS (H2回源)"
         echo -e "  ${YELLOW}[6]${NC} VLESS+gRPC+TLS"
         echo -e "  ${YELLOW}[7]${NC} Trojan+gRPC+TLS"
+        echo -e "  ${YELLOW}[8]${NC} VLESS+XHTTP+ENC+Vision+TLS (H2回源)"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
-        echo -e "  ${YELLOW}[8]${NC} Shadowsocks"
+        echo -e "  ${YELLOW}[9]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
         echo "  ==============================="
-        read -p "请选择 [0-8]: " choice
+        read -p "请选择 [0-9]: " choice
         if [ "$choice" != "0" ] && [ ! -f "$XRAY_BIN" ]; then
             _error "Xray 尚未安装！请先安装 Xray 核心。"
             read -p "按回车键返回..."; continue
@@ -1368,7 +1481,8 @@ _xray_add_node_menu() {
             5) _add_vless_h2_tls && _manage_xray_service "restart" ;;
             6) _add_vless_grpc_tls && _manage_xray_service "restart" ;;
             7) _add_trojan_grpc_tls && _manage_xray_service "restart" ;;
-            8) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
+            8) _add_vless_xhttp_enc_vision_tls && _manage_xray_service "restart" ;;
+            9) _add_shadowsocks_xray && _manage_xray_service "restart" ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
