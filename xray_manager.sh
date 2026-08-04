@@ -1254,11 +1254,22 @@ _add_xray_argo_vless_xhttp_enc() {
     local enc_key="" dec_key=""
     if [ -n "$vlessenc_out" ]; then
         if echo "$vlessenc_out" | jq -e . >/dev/null 2>&1; then
+            # 如果是 JSON 格式
             enc_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.encryption // .x25519.encryption // .encryption // empty')
             dec_key=$(echo "$vlessenc_out" | jq -r '.mlkem768.decryption // .x25519.decryption // .decryption // empty')
+        else
+            # 如果是文本格式，用正则表达式精准提取
+            enc_key=$(echo "$vlessenc_out" | grep -i 'encryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
+            dec_key=$(echo "$vlessenc_out" | grep -i 'decryption' | head -n 1 | grep -oE '[a-zA-Z0-9_\.\/-]+' | tail -n 1)
         fi
     fi
-    [ -z "$enc_key" ] || [ -z "$dec_key" ] || [ "$enc_key" == "null" ] && { _error "密钥生成失败，请确认 Xray 支持 'xray vlessenc'。"; return 1; }
+    
+    if [ -z "$enc_key" ] || [ -z "$dec_key" ] || [ "$enc_key" == "null" ]; then
+        _error "密钥生成失败，请确认 Xray 支持 'xray vlessenc'。"
+        echo -e "${YELLOW}xray vlessenc 原始输出如下：${NC}" >&2
+        $XRAY_BIN vlessenc >&2
+        return 1
+    fi
 
     local tag="xray-argo-vless-xhttp-${port}"
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" \
