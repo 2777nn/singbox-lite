@@ -33,6 +33,32 @@ if ! declare -f _info >/dev/null 2>&1; then
     _warning() { _warn "$1"; }
 fi
 
+# --- Argo隧道 ---
+if ! declare -f _install_cloudflared >/dev/null 2>&1; then
+    _install_cloudflared() {
+        local cf_bin="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+        if [ -f "$cf_bin" ]; then
+            _info "cloudflared 已安装: $($cf_bin --version 2>&1 | head -n1)"
+            return 0
+        fi
+        _info "正在安装依赖组件 (ca-certificates)..."
+        _pkg_install ca-certificates
+        _info "正在安装 cloudflared..."
+        local arch=$(uname -m)
+        local arch_tag
+        case $arch in
+            x86_64|amd64) arch_tag='amd64' ;;
+            aarch64|arm64) arch_tag='arm64' ;;
+            armv7l) arch_tag='arm' ;;
+            *) _error "不支持的架构：$arch"; return 1 ;;
+        esac
+        local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch_tag}"
+        wget -qO "$cf_bin" "$download_url" || { _error "cloudflared 下载失败!"; return 1; }
+        chmod +x "$cf_bin"
+        _success "cloudflared 安装成功: $($cf_bin --version 2>&1 | head -n1)"
+    }
+fi
+
 # --- URL 编码 ---
 if ! declare -f _url_encode >/dev/null 2>&1; then
     _url_encode() {
