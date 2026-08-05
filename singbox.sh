@@ -5111,7 +5111,7 @@ _install_or_update_xray() {
     _do_update_xray
 }
 
-# 执行 Xray 核心的安装/更新 (内联实现，避免依赖 xray_manager.sh 的 source)
+# 执行 Xray 核心的安装/更新
 _do_update_xray() {
     _info "--- 安装/更新 Xray 核心 ---"
     
@@ -5120,8 +5120,9 @@ _do_update_xray() {
     local is_first_install=false
     [ ! -f "$xray_bin" ] && is_first_install=true
     
-    # 确保 unzip 可用
-    command -v unzip &>/dev/null || _pkg_install unzip
+    mkdir -p "$(dirname "$xray_bin")" "$xray_dir"
+    local tmp_dir="${xray_dir}/.install_tmp_$$"
+    mkdir -p "$tmp_dir"
     
     local arch=$(uname -m)
     local xray_arch=""
@@ -5133,28 +5134,29 @@ _do_update_xray() {
     esac
     
     local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
-    local tmp_dir=$(mktemp -d)
-    local tmp_zip="${tmp_dir}/xray.zip"
     
     _info "下载地址: ${download_url}"
-    if ! wget -qO "$tmp_zip" "$download_url"; then
-        _error "Xray 下载失败！"
+
+    if ! wget -qO- "$download_url" | busybox unzip -o -d "$tmp_dir" - >/dev/null 2>&1; then
+        if ! wget -qO- "$download_url" | unzip -o -d "$tmp_dir" - >/dev/null 2>&1; then
+            _error "Xray 流式下载解压失败！"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+    
+    if [ ! -f "${tmp_dir}/xray" ]; then
+        _error "解压后未找到 xray 二进制文件！"
         rm -rf "$tmp_dir"
         return 1
     fi
     
-    if ! unzip -qo "$tmp_zip" -d "$tmp_dir"; then
-        _error "Xray 解压失败！"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    
-    mv "${tmp_dir}/xray" "$xray_bin"
+    _info "正在安装 Xray 文件..."
+    mv -f "${tmp_dir}/xray" "$xray_bin"
     chmod +x "$xray_bin"
     
-    mkdir -p "$xray_dir"
-    [ -f "${tmp_dir}/geoip.dat" ] && mv "${tmp_dir}/geoip.dat" "$xray_dir/"
-    [ -f "${tmp_dir}/geosite.dat" ] && mv "${tmp_dir}/geosite.dat" "$xray_dir/"
+    [ -f "${tmp_dir}/geoip.dat" ] && mv -f "${tmp_dir}/geoip.dat" "$xray_dir/"
+    [ -f "${tmp_dir}/geosite.dat" ] && mv -f "${tmp_dir}/geosite.dat" "$xray_dir/"
 
     rm -rf "$tmp_dir"
     _release_install_cache
