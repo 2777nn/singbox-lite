@@ -1281,8 +1281,6 @@ read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
     fi
 }
 
-export -f _install_cloudflared _start_argo_tunnel _stop_argo_tunnel _enable_argo_watchdog
-
 # 保留原始函数名作为薄包装器，确保向后兼容
 _add_argo_vless_ws() { _add_argo_node "vless"; }
 
