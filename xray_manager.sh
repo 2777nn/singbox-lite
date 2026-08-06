@@ -1490,7 +1490,7 @@ _add_xray_argo_vless_xhttp_enc() {
     local safe_path=$(_url_encode "$xhttp_path")
     local safe_enc=$(_url_encode "$enc_key")
     
-    local share_link="vless://${uuid}@${tunnel_domain}:443?security=tls&encryption=${safe_enc}&flow=${flow}&sni=${tunnel_domain}&alpn=h2&type=xhttp&mode=stream-one&path=${safe_path}&host=${tunnel_domain}#${safe_name}"
+    local share_link="vless://${uuid}@${tunnel_domain}:443?security=tls&encryption=${safe_enc}&flow=${flow}&sni=${tunnel_domain}&alpn=h2&type=xhttp&mode=packet-up&path=${safe_path}&host=${tunnel_domain}#${safe_name}"
 
     local argo_meta_file="/usr/local/etc/sing-box/argo_metadata.json"
     [ ! -f "$argo_meta_file" ] && echo '{}' > "$argo_meta_file"
@@ -1515,7 +1515,7 @@ _add_xray_argo_vless_xhttp_enc() {
         --arg pa "$xhttp_path" --arg f "$flow" --arg enc "$enc_key" \
         '{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:$f, tls:true, servername:$s,
           "skip-cert-verify":false, network:"xhttp", encryption:$enc,
-          "xhttp-opts":{mode:"stream-one", path:$pa, host:$s, headers:{Host:[$s]}}}')
+          "xhttp-opts":{mode:"packet-up", path:$pa, host:$s, headers:{Host:[$s]}}}')
     _add_node_to_yaml "$proxy_json"
 
     _enable_argo_watchdog
