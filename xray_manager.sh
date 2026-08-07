@@ -392,6 +392,42 @@ _generate_xray_cert() {
 #                   Xray 核心安装与管理
 # ============================================================
 
+# --- 内存限额计算 ---
+if ! declare -f _get_mem_limit >/dev/null 2>&1; then
+    _get_mem_limit() {
+        local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+        local cgroup_limit=""
+        local limit
+
+        [ -z "$total_mem_mb" ] && total_mem_mb=128
+
+        if [ -r /sys/fs/cgroup/memory.max ]; then
+            cgroup_limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+            if [ "$cgroup_limit" != "max" ] && [ -n "$cgroup_limit" ]; then
+                total_mem_mb=$((cgroup_limit / 1024 / 1024))
+            fi
+        elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+            cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+            if [ -n "$cgroup_limit" ] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+                total_mem_mb=$((cgroup_limit / 1024 / 1024))
+            fi
+        fi
+
+        if [ "$total_mem_mb" -le 128 ]; then
+            limit=48
+        elif [ "$total_mem_mb" -le 256 ]; then
+            limit=$((total_mem_mb * 50 / 100))
+        elif [ "$total_mem_mb" -le 512 ]; then
+            limit=$((total_mem_mb * 65 / 100))
+        else
+            limit=$((total_mem_mb * 80 / 100))
+        fi
+
+        [ "$limit" -lt 32 ] && limit=32
+        echo "$limit"
+    }
+fi
+
 _install_xray() {
     _info "正在安装/更新 Xray-core..."
     
@@ -442,6 +478,7 @@ _install_xray() {
 }
 
 _create_xray_systemd_service() {
+    local mem_limit_mb=$(_get_mem_limit)
     cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -449,6 +486,8 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="GOGC=30"
 ExecStart=${XRAY_BIN} run -c ${XRAY_CONFIG}
 Restart=on-failure
 RestartSec=3
@@ -462,6 +501,7 @@ EOF
 }
 
 _create_xray_openrc_service() {
+    local mem_limit_mb=$(_get_mem_limit)
     cat > /etc/init.d/xray <<EOF
 #!/sbin/openrc-run
 description="Xray Service"
@@ -469,7 +509,8 @@ command="${XRAY_BIN}"
 command_args="run -c ${XRAY_CONFIG}"
 pidfile="/run/xray.pid"
 command_background=true
-supervisor=supervise-daemon
+supervisor="supervise-daemon"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=30"
 EOF
     chmod +x /etc/init.d/xray
     rc-update add xray default 2>/dev/null
@@ -500,7 +541,8 @@ _manage_xray_service() {
                     :
                 else
                     rm -f "$pid_file"
-                    nohup "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 &
+                    local mem_limit_mb=$(_get_mem_limit)
+                    nohup env GOMEMLIMIT="${mem_limit_mb}MiB" GOGC=30 "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 &
                     echo $! > "$pid_file"
                 fi
                 ;;
