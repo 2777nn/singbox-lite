@@ -5178,7 +5178,8 @@ _do_update_xray() {
         elif [ "$INIT_SYSTEM" == "openrc" ]; then
             rc-service xray start
         elif [ "$INIT_SYSTEM" == "direct" ]; then
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
+            local mem_limit_mb=$(_get_mem_limit)
+            nohup env GOMEMLIMIT="${mem_limit_mb}MiB" GOGC=30 "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
             echo $! > /tmp/xray.pid
         fi
         _success "Xray 首次安装完成并已启动！"
@@ -5200,7 +5201,8 @@ _do_update_xray() {
                     kill "$xray_pid" 2>/dev/null
                 fi
             fi
-            nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
+            local mem_limit_mb=$(_get_mem_limit)
+            nohup env GOMEMLIMIT="${mem_limit_mb}MiB" GOGC=30 "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
             echo $! > /tmp/xray.pid
             _success "Xray direct 后台模式已重启。"
         fi
@@ -5211,6 +5213,8 @@ _do_update_xray() {
 _create_xray_service_from_main() {
     local xray_bin="/usr/local/bin/xray"
     local xray_dir="/usr/local/etc/xray"
+    local mem_limit_mb=$(_get_mem_limit)
+    
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         if [ ! -f "/etc/systemd/system/xray.service" ]; then
             cat > /etc/systemd/system/xray.service << EOF
@@ -5220,6 +5224,8 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+Environment="GOGC=30"
 ExecStart=${xray_bin} run -c ${xray_dir}/config.json
 Restart=on-failure
 RestartSec=3
@@ -5233,8 +5239,10 @@ EOF
         fi
     elif [ "$INIT_SYSTEM" == "openrc" ]; then
         if [ ! -f "/etc/init.d/xray" ]; then
-            cat > /etc/init.d/xray << 'EOF'
+            cat > /etc/init.d/xray << EOF
 #!/sbin/openrc-run
+export GOMEMLIMIT="${mem_limit_mb}MiB"
+export GOGC="30"
 name="xray"
 description="Xray Service"
 command="/usr/local/bin/xray"
