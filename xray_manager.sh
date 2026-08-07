@@ -33,6 +33,147 @@ if ! declare -f _info >/dev/null 2>&1; then
     _warning() { _warn "$1"; }
 fi
 
+# --- Argo 核心工具函数---
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+ARGO_METADATA_FILE="${ARGO_METADATA_FILE:-${SINGBOX_DIR}/argo_metadata.json}"
+
+if ! declare -f _install_cloudflared >/dev/null 2>&1; then
+    _install_cloudflared() {
+        if [ -f "${CLOUDFLARED_BIN}" ]; then
+            _info "cloudflared 已安装: $(${CLOUDFLARED_BIN} --version 2>&1 | head -n1)"
+            return 0
+        fi
+        _info "正在安装依赖组件 (ca-certificates)..."
+        _pkg_install ca-certificates
+        _info "正在安装 cloudflared..."
+        local arch=$(uname -m)
+        local arch_tag
+        case $arch in
+            x86_64|amd64) arch_tag='amd64' ;;
+            aarch64|arm64) arch_tag='arm64' ;;
+            armv7l) arch_tag='arm' ;;
+            *) _error "不支持的架构：$arch"; return 1 ;;
+        esac
+        local download_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch_tag}"
+        wget -qO "${CLOUDFLARED_BIN}" "$download_url" || { _error "cloudflared 下载失败!"; return 1; }
+        chmod +x "${CLOUDFLARED_BIN}"
+        _success "cloudflared 安装成功: $(${CLOUDFLARED_BIN} --version 2>&1 | head -n1)"
+    }
+fi
+
+if ! declare -f _start_argo_tunnel >/dev/null 2>&1; then
+    _start_argo_tunnel() {
+        local target_port="$1"
+        local protocol="$2"
+        local token="$3"
+        local pid_file="/tmp/singbox_argo_${target_port}.pid"
+        local log_file="/tmp/singbox_argo_${target_port}.log"
+
+        _info "正在启动 Argo 隧道 (端口: $target_port)..." >&2
+
+        if [ -f "$pid_file" ]; then
+            local old_pid=$(cat "$pid_file" 2>/dev/null)
+            if _is_pid_running_cmd "$old_pid" "$CLOUDFLARED_BIN"; then
+                _warn "检测到端口 $target_port 的 Argo 隧道已在运行 (PID: $old_pid)" >&2
+                return 0
+            fi
+        fi
+
+        rm -f "${log_file}"
+
+        if [ -n "$token" ]; then
+            _info "启动固定隧道 (Token 模式)..." >&2
+            nohup ${CLOUDFLARED_BIN} tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
+            local cf_pid=$!
+            echo "$cf_pid" > "${pid_file}"
+            sleep 5
+            if ! kill -0 "$cf_pid" 2>/dev/null; then
+                 _error "cloudflared 进程已退出！" >&2
+                 cat "${log_file}" 2>/dev/null | tail -20 >&2
+                 return 1
+            fi
+            _enable_argo_watchdog
+            _success "Argo 固定隧道 (端口: $target_port) 启动成功!" >&2
+            return 0
+        else
+            _info "启动临时隧道，指向 127.0.0.1:${target_port}..." >&2
+            nohup ${CLOUDFLARED_BIN} tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
+                --logfile "${log_file}" > /dev/null 2>&1 &
+            local cf_pid=$!
+            echo "$cf_pid" > "${pid_file}"
+
+            _info "等待隧道建立 (最多30秒)..." >&2
+            local tunnel_domain=""
+            local wait_count=0
+            local max_wait=30
+
+            while [ $wait_count -lt $max_wait ]; do
+                sleep 2
+                wait_count=$((wait_count + 2))
+                if ! kill -0 "$cf_pid" 2>/dev/null; then
+                    _error "cloudflared 进程已退出，请检查日志: ${log_file}" >&2
+                    cat "${log_file}" 2>/dev/null | tail -20 >&2
+                    return 1
+                fi
+                if [ -f "${log_file}" ]; then
+                    tunnel_domain=$(grep -oE 'https?://[a-zA-Z0-9-]+\.trycloudflare\.com' "${log_file}" 2>/dev/null | head -n 1 | sed -E 's|https?://||')
+                    if [ -n "$tunnel_domain" ]; then break; fi
+                fi
+                echo -n "." >&2
+            done
+            echo "" >&2
+
+            if [ -n "$tunnel_domain" ]; then
+                _info "域名已获取，正在进行稳定性测试 (5秒)..." >&2
+                sleep 5
+                if ! kill -0 "$cf_pid" 2>/dev/null; then
+                     _error "稳定性测试失败：cloudflared 进程异常退出。" >&2
+                     cat "${log_file}" 2>/dev/null | tail -n 10 >&2
+                     return 1
+                fi
+                _enable_argo_watchdog
+                _success "Argo 临时隧道建立成功: ${tunnel_domain}" >&2
+                echo "$tunnel_domain"
+                return 0
+            else
+                _error "获取临时域名超时。" >&2
+                kill "$cf_pid" 2>/dev/null
+                rm -f "${pid_file}"
+                return 1
+            fi
+        fi
+    }
+fi
+
+if ! declare -f _stop_argo_tunnel >/dev/null 2>&1; then
+    _stop_argo_tunnel() {
+        local target_port="$1"
+        [ -z "$target_port" ] && return
+        local pid_file="/tmp/singbox_argo_${target_port}.pid"
+        local log_file="/tmp/singbox_argo_${target_port}.log"
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
+                kill "$pid" 2>/dev/null
+                _success "Argo 隧道 (端口: $target_port) 已停止"
+            fi
+            rm -f "$pid_file" "$log_file"
+        fi
+    }
+fi
+
+if ! declare -f _enable_argo_watchdog >/dev/null 2>&1; then
+    _enable_argo_watchdog() {
+        local sb_path="${SELF_SCRIPT_PATH:-/usr/local/etc/sing-box/singbox.sh}"
+        [ ! -f "$sb_path" ] && sb_path="/usr/local/etc/sing-box/singbox.sh"
+        local job="* * * * * bash ${sb_path} keepalive >/dev/null 2>&1"
+        if ! crontab -l 2>/dev/null | grep -Fq "keepalive"; then
+            _info "正在添加后台守护进程 (Watchdog)..."
+            (crontab -l 2>/dev/null; echo "$job") | crontab -
+        fi
+    }
+fi
+
 # --- URL 编码 ---
 if ! declare -f _url_encode >/dev/null 2>&1; then
     _url_encode() {
