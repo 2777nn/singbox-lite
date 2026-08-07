@@ -508,7 +508,6 @@ description="Xray Service"
 command="${XRAY_BIN}"
 command_args="run -c ${XRAY_CONFIG}"
 pidfile="/run/xray.pid"
-command_background=true
 supervisor="supervise-daemon"
 supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env GOGC=30"
 EOF
