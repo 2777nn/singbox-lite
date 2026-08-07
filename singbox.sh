@@ -5247,8 +5247,8 @@ name="xray"
 description="Xray Service"
 command="/usr/local/bin/xray"
 command_args="run -c /usr/local/etc/xray/config.json"
-command_background=true
 pidfile="/run/xray.pid"
+supervisor="supervise-daemon"
 EOF
             chmod +x /etc/init.d/xray
             rc-update add xray default 2>/dev/null
