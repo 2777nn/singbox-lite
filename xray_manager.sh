@@ -413,7 +413,9 @@ if ! declare -f _get_mem_limit >/dev/null 2>&1; then
             fi
         fi
 
-        if [ "$total_mem_mb" -le 128 ]; then
+        if [ "$total_mem_mb" -le 64 ]; then
+            limit=26
+        elif [ "$total_mem_mb" -le 128 ]; then
             limit=48
         elif [ "$total_mem_mb" -le 256 ]; then
             limit=$((total_mem_mb * 50 / 100))
