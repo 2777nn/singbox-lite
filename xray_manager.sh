@@ -1386,7 +1386,145 @@ _add_vless_h2_tls() {
 }
 
 # ============================================================
-#         7. VLESS + gRPC + TLS (支持CF回源)
+#    7. VLESS + XHTTP + ENC + Vision + TLS (支持 CF 回源)
+# ============================================================
+
+_add_vless_xhttp_enc_vision_tls() {
+    [ -z "$server_ip" ] && server_ip=$(_get_public_ip)
+    local node_ip="$server_ip"
+    
+    read -p "请输入服务器IP (默认: ${server_ip}): " custom_ip
+    node_ip=${custom_ip:-$server_ip}
+    
+    local port=$(_input_port)
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
+    
+    local path="/$(openssl rand -hex 6)"
+    read -p "请输入 XHTTP 路径 (默认: ${path}): " custom_path
+    path=${custom_path:-$path}
+    [[ ! "$path" == /* ]] && path="/${path}"
+    
+    local default_name="X-VLESS-XHTTP-ENC-Vision-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    
+    # 1. 生成 UUID 与后量子加密密钥 (ML-KEM-768 VLESS Encryption)
+    local uuid=$($XRAY_BIN uuid)
+    local vlessenc_out=$($XRAY_BIN vlessenc 2>&1)
+    # 取后量子 ML-KEM-768 认证算法的 decryption 与 encryption
+    local decryption=$(echo "$vlessenc_out" | grep '"decryption":' | tail -n 1 | awk -F'"' '{print $4}')
+    local encryption=$(echo "$vlessenc_out" | grep '"encryption":' | tail -n 1 | awk -F'"' '{print $4}')
+    
+    if [ -z "$decryption" ] || [ -z "$encryption" ]; then
+        _error "生成 VLESS ENC 密钥对失败！请确保当前 Xray-core 已支持 vlessenc 功能。"
+        return 1
+    fi
+    _info "已成功生成后量子 (ML-KEM-768) VLESS Encryption 密钥对。"
+    
+    local tag="xray-vless-xhttp-enc-${port}"
+    local cert_path="${XRAY_DIR}/${tag}.pem"
+    local key_path="${XRAY_DIR}/${tag}.key"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    
+    # 2. 生成自签证书
+    _generate_xray_cert "$sni" "$cert_path" "$key_path" || return 1
+    
+    # 3. 构建 Inbound (XHTTP + ENC + xtls-rprx-vision + TLS)
+    local inbound=$(jq -n \
+        --arg tag "$tag" \
+        --argjson port "$port" \
+        --arg uuid "$uuid" \
+        --arg dec "$decryption" \
+        --arg cert "$cert_path" \
+        --arg key "$key_path" \
+        --arg sn "$sni" \
+        --arg pa "$path" \
+        '{
+            tag: $tag,
+            listen: "::",
+            port: $port,
+            protocol: "vless",
+            settings: {
+                clients: [
+                    {
+                        id: $uuid,
+                        flow: "xtls-rprx-vision"
+                    }
+                ],
+                decryption: $dec
+            },
+            streamSettings: {
+                network: "xhttp",
+                security: "tls",
+                tlsSettings: {
+                    certificates: [
+                        {
+                            certificateFile: $cert,
+                            keyFile: $key
+                        }
+                    ],
+                    alpn: ["h2", "http/1.1"]
+                },
+                xhttpSettings: {
+                    mode: "auto",
+                    host: $sn,
+                    path: $pa
+                }
+            }
+        }')
+    
+    _xray_atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
+    
+    # 4. 生成新版支持 XHTTP 与 VLESS Encryption 的 Mihomo/Clash 配置
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg u "$uuid" \
+        --arg f "xtls-rprx-vision" --arg sn "$sni" --arg enc "$encryption" --arg pa "$path" \
+        '{
+            name: $n,
+            type: "vless",
+            server: $s,
+            port: $p,
+            uuid: $u,
+            flow: $f,
+            tls: true,
+            servername: $sn,
+            "skip-cert-verify": true,
+            network: "xhttp",
+            encryption: $enc,
+            "xhttp-opts": {
+                mode: "auto",
+                path: $pa,
+                headers: {
+                    Host: $sn
+                }
+            }
+        }')
+    _xray_add_node_to_yaml "$proxy_json" 2>/dev/null || true
+    
+    # 5. 生成标准 VLESS 分享链接
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param="&insecure=1"
+    [ -n "$cert_pcs" ] && insecure_param="&pcs=${cert_pcs}"
+    
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=$(_url_encode "$encryption")&flow=xtls-rprx-vision&sni=${sni}&alpn=h2,http/1.1&type=xhttp&mode=auto&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
+    
+    _save_xray_meta "$tag" "$name" "$link" "encryption=$encryption" "decryption=$decryption" || return 1
+    
+    _info "此节点支持 Cloudflare CDN 回源 (需在 CF 开启小黄云 Proxied，SSL/TLS 模式设为 Full)"
+    _success "VLESS+XHTTP+ENC+Vision+TLS 节点 [${name}] 添加成功！"
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
+}
+
+# ============================================================
+#         8. VLESS + gRPC + TLS (支持CF回源)
 # ============================================================
 
 _add_xray_vless_grpc_tls() {
@@ -1470,7 +1608,7 @@ _add_xray_vless_grpc_tls() {
 }
 
 # ============================================================
-#         8. Trojan + gRPC + TLS (支持CF回源)
+#         9. Trojan + gRPC + TLS (支持CF回源)
 # ============================================================
 
 _add_trojan_grpc_tls() {
@@ -1565,11 +1703,13 @@ _view_xray_nodes() {
     echo ""
     echo -e "${YELLOW}══════════════════ Xray 节点列表 ══════════════════${NC}"
     local count=0
-    while IFS=$'\t' read -r tag protocol port network security name link; do
+    while IFS=$'\t' read -r tag protocol port network security name link flow decryption; do
         [ -z "$tag" ] && continue
         count=$((count + 1))
         local desc="${protocol}"
         [ "$network" != "null" ] && [ "$network" != "tcp" ] && desc="${desc}+${network}"
+        [ "$decryption" != "null" ] && [ "$decryption" != "none" ] && [ -n "$decryption" ] && desc="${desc}+ENC"
+        [ "$flow" != "null" ] && [ -n "$flow" ] && desc="${desc}+Vision"
         [ "$security" != "null" ] && [ "$security" != "none" ] && desc="${desc}+${security}"
         echo ""
         echo -e "  ${GREEN}[${count}]${NC} ${CYAN}${name}${NC}"
@@ -1586,7 +1726,9 @@ _view_xray_nodes() {
             ($in.streamSettings.network // "tcp"),
             ($in.streamSettings.security // "none"),
             ($m.name // $in.tag),
-            ($m.share_link // "")
+            ($m.share_link // ""),
+            ($in.settings.clients[0].flow // ""),
+            ($in.settings.decryption // "none")
         ] | @tsv
     ' "$XRAY_CONFIG" 2>/dev/null)
     echo ""
@@ -1771,13 +1913,14 @@ _xray_add_node_menu() {
         echo -e "  ${YELLOW}[4]${NC} Trojan+gRPC+Reality"
         echo -e "  ${CYAN}  ── TLS 协议 (支持CF回源) ──${NC}"
         echo -e "  ${YELLOW}[5]${NC} VLESS+XHTTP+TLS (H2回源)"
-        echo -e "  ${YELLOW}[6]${NC} VLESS+gRPC+TLS"
-        echo -e "  ${YELLOW}[7]${NC} Trojan+gRPC+TLS"
+        echo -e "  ${YELLOW}[6]${NC} VLESS+XHTTP+ENC+Vision+TLS (H2回源)"
+        echo -e "  ${YELLOW}[7]${NC} VLESS+gRPC+TLS"
+        echo -e "  ${YELLOW}[8]${NC} Trojan+gRPC+TLS"
         echo -e "  ${CYAN}  ── 其他 ──${NC}"
-        echo -e "  ${YELLOW}[8]${NC} Shadowsocks"
+        echo -e "  ${YELLOW}[9]${NC} Shadowsocks"
         echo -e "  ${RED}[0]${NC} 返回"
         echo "  ==============================="
-        read -p "请选择 [0-8]: " choice
+        read -p "请选择 [0-9]: " choice
         if [ "$choice" != "0" ] && [ ! -f "$XRAY_BIN" ]; then
             _error "Xray 尚未安装！请先安装 Xray 核心。"
             read -p "按回车键返回..."; continue
@@ -1788,9 +1931,10 @@ _xray_add_node_menu() {
             3) _with_singboxlite_lock _run_xray_transaction _add_trojan_xhttp_reality ;;
             4) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_reality ;;
             5) _with_singboxlite_lock _run_xray_transaction _add_vless_h2_tls ;;
-            6) _with_singboxlite_lock _run_xray_transaction _add_xray_vless_grpc_tls ;;
-            7) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_tls ;;
-            8) _with_singboxlite_lock _run_xray_transaction _add_shadowsocks_xray ;;
+            6) _with_singboxlite_lock _run_xray_transaction _add_vless_xhttp_enc_vision_tls ;;
+            7) _with_singboxlite_lock _run_xray_transaction _add_xray_vless_grpc_tls ;;
+            8) _with_singboxlite_lock _run_xray_transaction _add_trojan_grpc_tls ;;
+            9) _with_singboxlite_lock _run_xray_transaction _add_shadowsocks_xray ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
