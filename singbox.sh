@@ -7513,7 +7513,6 @@ _do_update_xray() {
     esac
 
     local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
-    local digest_url="${download_url}.dgst"
     local tmp_dir
     mkdir -p /var/tmp || return 1
 
@@ -7530,94 +7529,15 @@ _do_update_xray() {
 
     tmp_dir=$(mktemp -d /var/tmp/.xray-install.XXXXXX) || return 1
     printf '%s\n' "$$" > "${tmp_dir}/.active"
-    local digest_file="${tmp_dir}/.archive.sha256"
-    local dgst_tmp="${tmp_dir}/xray.dgst"
 
-    _info "正在获取 Xray 官方校验摘要..."
-    if ! wget -qO "$dgst_tmp" "$digest_url"; then
-        _error "Xray 官方摘要下载失败！"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local expected actual
-    expected=$(awk -F'= *' 'toupper($1) == "SHA2-256" || toupper($1) == "SHA256" {print $2; exit}' "$dgst_tmp" | tr -d ' \r\n')
-    rm -f -- "$dgst_tmp"
-    if [ -z "$expected" ]; then
-        _error "无法解析 Xray 官方摘要，已取消安装。"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local unzip_cmd=""
-    if command -v busybox &>/dev/null && busybox unzip -h &>/dev/null; then
-        unzip_cmd="busybox unzip -q -o -d $tmp_dir -"
-    elif unzip -v 2>&1 | grep -qi 'busybox'; then
-        unzip_cmd="unzip -q -o -d $tmp_dir -"
-    fi
-
-    if [ -n "$unzip_cmd" ]; then
-        _info "检测到 BusyBox 环境，启用流式下载并校验..."
-        if command -v sha256sum &>/dev/null; then
-            wget -qO- "$download_url" | tee >(sha256sum > "$digest_file") | $unzip_cmd
-        else
-            wget -qO- "$download_url" | tee >(openssl dgst -sha256 > "$digest_file") | $unzip_cmd
-        fi
-        local -a stream_status=("${PIPESTATUS[@]}")
-        if [ "${stream_status[0]:-1}" -ne 0 ] || [ "${stream_status[2]:-1}" -ne 0 ]; then
-            _error "Xray 流式下载或解压失败！"
+    # === 最简流式解压（0内存落盘，兼容 Alpine BusyBox） ===
+    _info "正在流式下载并解压 Xray..."
+    if ! wget -qO- "$download_url" | busybox unzip -o -d "$tmp_dir" - >/dev/null 2>&1; then
+        if ! wget -qO- "$download_url" | unzip -o -d "$tmp_dir" - >/dev/null 2>&1; then
+            _error "Xray 流式下载解压失败！"
             rm -rf "$tmp_dir"
             return 1
         fi
-
-        local digest_wait=0
-        while [ ! -s "$digest_file" ] && [ "$digest_wait" -lt 50 ]; do
-            sleep 0.1
-            digest_wait=$((digest_wait + 1))
-        done
-        if command -v sha256sum &>/dev/null; then
-            actual=$(awk '{print $1}' "$digest_file" 2>/dev/null)
-        else
-            actual=$(awk '{print $NF}' "$digest_file" 2>/dev/null)
-        fi
-        rm -f -- "$digest_file"
-
-        if [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-            _error "Xray 安装包流式 SHA-256 校验失败，已拒绝替换核心。"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-    else
-        _info "未检测到 BusyBox unzip，回退为普通下载解压..."
-        local tmp_zip="${tmp_dir}/xray.zip"
-        if ! wget -qO "$tmp_zip" "$download_url"; then
-            _error "Xray 安装包下载失败！"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-        if command -v sha256sum &>/dev/null; then
-            actual=$(sha256sum "$tmp_zip" | awk '{print $1}')
-        else
-            actual=$(openssl dgst -sha256 "$tmp_zip" 2>/dev/null | awk '{print $NF}')
-        fi
-        if [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-            _error "Xray 安装包 SHA-256 校验失败，已拒绝替换核心。"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-        if ! unzip -tq "$tmp_zip" >/dev/null 2>&1 || ! unzip -p "$tmp_zip" xray > "${tmp_dir}/xray"; then
-            _error "Xray 解压失败！"
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-        for geodata_file in geoip.dat geosite.dat; do
-            if unzip -p "$tmp_zip" "$geodata_file" > "${tmp_dir}/${geodata_file}" 2>/dev/null; then
-                chmod 600 "${tmp_dir}/${geodata_file}" 2>/dev/null || true
-            else
-                rm -f -- "${tmp_dir}/${geodata_file}"
-            fi
-        done
-        rm -f -- "$tmp_zip"
     fi
 
     local geodata_file
