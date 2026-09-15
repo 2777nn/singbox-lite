@@ -1413,9 +1413,24 @@ _add_vless_xhttp_enc_vision_tls() {
     # 1. 生成 UUID 与后量子加密密钥 (ML-KEM-768 VLESS Encryption)
     local uuid=$($XRAY_BIN uuid)
     local vlessenc_out=$($XRAY_BIN vlessenc 2>&1)
-    # 取后量子 ML-KEM-768 认证算法的 decryption 与 encryption
-    local decryption=$(echo "$vlessenc_out" | grep '"decryption":' | tail -n 1 | awk -F'"' '{print $4}')
-    local encryption=$(echo "$vlessenc_out" | grep '"encryption":' | tail -n 1 | awk -F'"' '{print $4}')
+    
+    echo ""
+        echo "请选择 VLESS Encryption 密钥规格:"
+        echo "  1) 短密钥 (X25519认证，会话全程后量子加密，链接短兼容好，推荐)"
+        echo "  2) 长密钥 (ML-KEM-768全量子认证，链接长达1.6KB，不适合二维码)"
+        read -p "请选择 [1/2] (默认: 1): " enc_choice
+        enc_choice=${enc_choice:-1}
+    
+        local decryption="" encryption=""
+        if [ "$enc_choice" == "2" ]; then
+            decryption=$(echo "$vlessenc_out" | grep '"decryption":' | tail -n 1 | awk -F'"' '{print $4}')
+            encryption=$(echo "$vlessenc_out" | grep '"encryption":' | tail -n 1 | awk -F'"' '{print $4}')
+            _info "已选用 ML-KEM-768 长密钥。"
+        else
+            decryption=$(echo "$vlessenc_out" | grep '"decryption":' | head -n 1 | awk -F'"' '{print $4}')
+            encryption=$(echo "$vlessenc_out" | grep '"encryption":' | head -n 1 | awk -F'"' '{print $4}')
+            _info "已选用 X25519 短密钥（具备后量子会话加密）。"
+        fi
     
     if [ -z "$decryption" ] || [ -z "$encryption" ]; then
         _error "生成 VLESS ENC 密钥对失败！请确保当前 Xray-core 已支持 vlessenc 功能。"
