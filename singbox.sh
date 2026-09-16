@@ -4090,48 +4090,37 @@ _add_vless_xhttp_enc_tls() {
     local port=""
     local client_server_addr="${server_ip}"
 
-    if [ "$BATCH_MODE" = "true" ]; then
-        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
-        port="$BATCH_PORT"
-        camouflage_domain="${BATCH_XHTTP_TLS_DOMAIN:-$BATCH_SNI}"
-    else
-        _info "--- VLESS (XHTTP+ENC+Vision+TLS) 设置向导 (CF回源) ---"
-        _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
+    _info "--- VLESS (XHTTP+ENC+Vision+TLS) 设置向导 (CF回源) ---"
+    _info "请输入客户端用于“连接”的地址:"
+    _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
+    _info "  - (其他) 您也可以手动输入一个IP或域名"
+    read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+    client_server_addr=${connection_address:-$server_ip}
 
-        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-             client_server_addr="[${client_server_addr}]"
-        fi
-
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名 (CF回源填绑定域名)。"
-        _info " (例如: xxx.yourdomain.com)"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
-
-        while true; do
-            read -p "请输入监听端口 (直连/回源模式下首推 443 端口): " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
-            break
-        done
+    if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+         client_server_addr="[${client_server_addr}]"
     fi
+
+    _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名 (CF回源填绑定域名)。"
+    read -p "请输入伪装域名: " camouflage_domain
+    [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+
+    while true; do
+        read -p "请输入监听端口 (直连/回源模式下首推 443 端口): " port
+        [[ -z "$port" ]] && _error "端口不能为空" && continue
+        _check_port_conflict "$port" "tcp" && continue
+        break
+    done
 
     local client_port="$port"
     local xhttp_path=""
-    if [ "$BATCH_MODE" = "true" ]; then
+    read -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
+    if [ -z "$input_xhttp_path" ]; then
         xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
     else
-        read -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
-        if [ -z "$input_xhttp_path" ]; then
-            xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-            _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
-        else
-            xhttp_path="$input_xhttp_path"
-            [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
-        fi
+        xhttp_path="$input_xhttp_path"
+        [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
     fi
 
     local tag="vless-xhttp-in-${port}"
@@ -4139,17 +4128,12 @@ _add_vless_xhttp_enc_tls() {
     local key_path=""
     local skip_verify=false
 
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
+    echo ""
+    echo "请选择证书类型:"
+    echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
+    echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
+    read -p "请选择 [1-2] (默认: 1): " cert_choice
+    cert_choice=${cert_choice:-1}
 
     if [ "$cert_choice" == "1" ]; then
         cert_path="${SINGBOX_DIR}/${tag}.pem"
@@ -4172,20 +4156,15 @@ _add_vless_xhttp_enc_tls() {
         fi
     fi
 
-    local name=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-VLESS-XHTTP-ENC-${port}"
-    else
-        local default_name="VLESS-XHTTP-ENC-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-        name=${custom_name:-$default_name}
-    fi
+    local default_name="VLESS-XHTTP-ENC-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
 
     local uuid=$(${SINGBOX_BIN} generate uuid)
 
-    # 关键：调用 sing-box 原生 reality-keypair 生成 X25519 密钥
+    # 调用原生 reality-keypair 命令生成 X25519 密钥
     local keypair private_key public_key
-    keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+    keypair=$(${SINGBOX_BIN} generate reality-keypair)
     private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
     public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
@@ -4195,6 +4174,7 @@ _add_vless_xhttp_enc_tls() {
     local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
     local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
 
+    # 包含 x_padding_bytes 的合法 XHTTP 入站
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
@@ -4258,8 +4238,7 @@ _add_vless_xhttp_enc_tls() {
                     }
                 }
             }')
-
-    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+    _add_node_to_yaml "$proxy_json"
 
     local meta_json=$(jq -n \
         --arg n "$name" \
@@ -4269,19 +4248,21 @@ _add_vless_xhttp_enc_tls() {
         --arg pk "$public_key" \
         --arg sk "$private_key" \
         '{name:$n, server_name:$sn, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
 
+    # 直接安全重启服务
+    _manage_service restart
+
+    echo ""
     _success "VLESS (XHTTP+ENC+Vision+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
-    _success "XHTTP 传输路径: ${xhttp_path}"
-    _success "VLESS ENC 加密: ${client_encryption}"
-
-    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
+    _success "客户端连接地址: ${client_server_addr}"
+    _success "监听端口: ${client_port}"
+    _success "SNI/Host: ${camouflage_domain}"
+    _success "XHTTP 路径: ${xhttp_path}"
+    _show_cdn_guidance "${camouflage_domain}" "${port}"
 
     local link_ip="$client_server_addr"
-    _show_node_link "vless-xhttp-enc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$xhttp_path" "$skip_verify" "$cert_path" "$client_encryption" || return 1
+    _show_node_link "vless-xhttp-enc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$xhttp_path" "$skip_verify" "$cert_path" "$client_encryption"
 }
 
 _add_trojan_ws_tls() {
@@ -8777,7 +8758,7 @@ _show_add_node_menu() {
         2) _run_main_create_transaction _add_vless_ws_tls ;;
         3) _run_main_create_transaction _add_trojan_ws_tls ;;
         4) _run_main_create_transaction _add_vless_grpc_tls ;;
-        5) _run_main_create_transaction _add_vless_xhttp_enc_tls ;;
+        5) _add_vless_xhttp_enc_tls ;;
         6) _run_main_create_transaction _add_anytls ;;
         7) _run_main_create_transaction _add_hysteria2 ;;
         8) _run_main_create_transaction _add_tuic ;;
