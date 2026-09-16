@@ -2152,6 +2152,7 @@ _add_argo_node() {
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg xp "$ws_path" \
             '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,x_padding_bytes:"100-1000"}}')    elif [ "$protocol" == "vless-ws-enc" ]; then
+    elif [ "$protocol" == "vless-ws-enc" ]; then
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg wsp "$ws_path" \
             --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
