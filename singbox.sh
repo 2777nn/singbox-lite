@@ -2151,8 +2151,7 @@ _add_argo_node() {
     elif [ "$protocol" == "vless-xhttp-enc" ]; then
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg xp "$ws_path" \
-            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,mode:"packet-up",x_padding_bytes:"100-1000"}}')
-    elif [ "$protocol" == "vless-ws-enc" ]; then
+            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,x_padding_bytes:"100-1000"}}')    elif [ "$protocol" == "vless-ws-enc" ]; then
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg wsp "$ws_path" \
             --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
@@ -4201,7 +4200,6 @@ _add_vless_xhttp_enc_tls() {
             "transport": {
                 "type": "xhttp",
                 "path": $xp,
-                "mode": "stream-one",
                 "x_padding_bytes": "100-1000"
             }
         }')
@@ -4249,9 +4247,6 @@ _add_vless_xhttp_enc_tls() {
         --arg sk "$private_key" \
         '{name:$n, server_name:$sn, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
-
-    # 直接安全重启服务
-    _manage_service restart
 
     echo ""
     _success "VLESS (XHTTP+ENC+Vision+TLS) 节点 [${name}] 添加成功!"
@@ -8758,7 +8753,7 @@ _show_add_node_menu() {
         2) _run_main_create_transaction _add_vless_ws_tls ;;
         3) _run_main_create_transaction _add_trojan_ws_tls ;;
         4) _run_main_create_transaction _add_vless_grpc_tls ;;
-        5) _add_vless_xhttp_enc_tls ;;
+        5) _run_main_create_transaction _add_vless_xhttp_enc_tls ;;
         6) _run_main_create_transaction _add_anytls ;;
         7) _run_main_create_transaction _add_hysteria2 ;;
         8) _run_main_create_transaction _add_tuic ;;
