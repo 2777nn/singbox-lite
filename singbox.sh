@@ -2151,7 +2151,7 @@ _add_argo_node() {
     elif [ "$protocol" == "vless-xhttp-enc" ]; then
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg xp "$ws_path" \
-            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,mode:"packet-up"}}')
+            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,mode:"packet-up",x_padding_bytes:"100-1000"}}')
     elif [ "$protocol" == "vless-ws-enc" ]; then
         inbound_json=$(jq -n \
             --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg wsp "$ws_path" \
@@ -3554,12 +3554,12 @@ _show_node_link() {
             # 参数: uuid, sni, xhttp_path, skip_verify, cert_path, enc_key
             local uuid="$1" sni="${2:-$DEFAULT_SNI}" xhttp_path="$3" skip_verify="$4" cert_path="$5" enc_key="$6"
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "vless-xhttp-argo")
             # Argo 专用: uuid, path, enc_key
             local uuid="$1" xhttp_path="$2" enc_key="$3"
-            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&alpn=h2&type=xhttp&mode=packet-up&host=${link_ip}&path=$(_url_encode "$xhttp_path")&sni=${link_ip}#$(_url_encode "$name")"
+            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&alpn=h2&type=xhttp&mode=packet-up&host=${link_ip}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${link_ip}#$(_url_encode "$name")"
             ;;
         "vless-ws-enc-argo")
             # Argo 专用: uuid, path, enc_key
@@ -4221,7 +4221,8 @@ _add_vless_xhttp_enc_tls() {
             "transport": {
                 "type": "xhttp",
                 "path": $xp,
-                "mode": "stream-one"
+                "mode": "stream-one",
+                "x_padding_bytes": "100-1000"
             }
         }')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
