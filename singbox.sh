@@ -8466,12 +8466,10 @@ _run_main_create_transaction_locked() (
     fi
 
     _ensure_relay_config || return 1
-    _info "正在执行核心配置语法校验..."
-    "$SINGBOX_BIN" check -c "$CONFIG_FILE" -c "$RELAY_CONFIG_FILE"
-    local check_rc=$?
-    if [ $check_rc -ne 0 ]; then
-        _warn "校验命令退出码: $check_rc"
-        # return 1
+    if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "新节点未通过 config.json + relay.json 组合校验："
+        echo "$check_result"
+        return 1
     fi
 
     restart_attempted=1
