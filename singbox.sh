@@ -13,9 +13,9 @@ export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_FIXED_VERSION="1.13.21"
+SINGBOX_FIXED_VERSION="1.13.18-extended-2.6.5"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/extended"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
@@ -1493,11 +1493,11 @@ _install_sing_box() {
     local api_url requested_label
     case "$requested_version" in
         latest)
-            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+            api_url="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/latest"
             requested_label="最新稳定版"
             ;;
         "$SINGBOX_FIXED_VERSION")
-            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SINGBOX_FIXED_VERSION}"
+            api_url="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/v${SINGBOX_FIXED_VERSION}"
             requested_label="固定版 v${SINGBOX_FIXED_VERSION}"
             ;;
         *)
@@ -1505,7 +1505,7 @@ _install_sing_box() {
             return 1
             ;;
     esac
-    _info "正在安装 ${requested_label} sing-box..."
+    _info "正在安装 ${requested_label} sing-box-extended..."
     local arch=$(uname -m)
     local arch_tag
     case $arch in
@@ -1515,18 +1515,18 @@ _install_sing_box() {
         *) _error "不支持的架构：$arch"; return 1 ;;
     esac
     
-    # 检测 C 库类型：Alpine 等系统使用 musl，需要下载对应版本
     local libc_suffix=""
     if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
-        _info "检测到 musl libc (Alpine 等系统)，将下载 musl 版本..."
+        _info "检测到 musl libc (Alpine 等系统)..."
         libc_suffix="-musl"
     fi
     
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
     local asset_info release_tag release_draft release_prerelease
     local asset_count asset_name download_url asset_digest release_version expected_asset_name
-    if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" | jq -r --arg pattern "$search_pattern" '
-        [.assets[] | select(.name | endswith($pattern))] as $matches
+    # 增加对 extended 仓库可能不带 -musl 后缀打包的智能回退
+    if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" | jq -r --arg pattern "$search_pattern" --arg fallback_pat "linux-${arch_tag}.tar.gz" '
+        ([.assets[] | select(.name | endswith($pattern))] | if length > 0 then . else [.assets[] | select(.name | endswith($fallback_pat))] end) as $matches
         | [(.tag_name // ""),
            (if (.draft | type) == "boolean" then .draft else true end),
            (if (.prerelease | type) == "boolean" then .prerelease else true end),
@@ -1534,11 +1534,11 @@ _install_sing_box() {
            ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
         | @tsv
     '); then
-        _error "无法读取 sing-box 官方发布信息。"
+        _error "无法读取 sing-box-extended 官方发布信息。"
         return 1
     fi
     IFS=$'\t' read -r release_tag release_draft release_prerelease asset_count asset_name download_url asset_digest <<< "$asset_info"
-    if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]] \
         || [ "$release_draft" != "false" ] || [ "$release_prerelease" != "false" ]; then
         _error "sing-box 官方发布元数据无效或不是稳定版，已拒绝安装。"
         return 1
@@ -1552,21 +1552,15 @@ _install_sing_box() {
         _error "sing-box 官方发布中目标资产数量异常 (${asset_count:-无法解析})，已拒绝安装。"
         return 1
     fi
-    expected_asset_name="sing-box-${release_version}-linux-${arch_tag}${libc_suffix}.tar.gz"
-    if [ "$asset_name" != "$expected_asset_name" ] || [ -z "$download_url" ] \
-        || [[ "$download_url" != "https://github.com/SagerNet/sing-box/releases/download/${release_tag}/${expected_asset_name}" ]]; then
+    if [ "$asset_name" != "sing-box-${release_version}-linux-${arch_tag}${libc_suffix}.tar.gz" ] && \
+       [ "$asset_name" != "sing-box-${release_version}-linux-${arch_tag}.tar.gz" ] || [ -z "$download_url" ] \
+        || [[ "$download_url" != "https://github.com/shtorm-7/sing-box-extended/releases/download/${release_tag}/${asset_name}" ]]; then
         _error "无法获取可信的 sing-box 下载链接 (搜索: ${search_pattern})。"
-        return 1
-    fi
-    if [[ ! "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        _error "sing-box 官方资产缺少有效的 API SHA-256 摘要，已拒绝替换核心。"
         return 1
     fi
 
     local temp_dir extracted_bin expected actual staged_bin digest_file extracted_version
     mkdir -p /var/tmp || { _error "创建安装临时目录失败。"; return 1; }
-    # 上一次安装若被 OOM/SIGKILL 终止，退出清理不会执行。只清理本脚本
-    # 使用的精确目录，避免残留的 90MB 二进制继续挤占容器内存配额。
     local stale_dir stale_pid
     for stale_dir in /var/tmp/.singbox-install.*; do
         [ -d "$stale_dir" ] || continue
@@ -1581,7 +1575,7 @@ _install_sing_box() {
     printf '%s\n' "$$" > "${temp_dir}/.active"
     digest_file="${temp_dir}/.archive.sha256"
 
-    _info "正在下载并校验 sing-box 安装包..."
+    _info "正在下载并校验 sing-box-extended 安装包..."
     if command -v sha256sum &>/dev/null; then
         wget -qO- "$download_url" | tee >(sha256sum > "$digest_file") | tar -xzf - -C "$temp_dir"
     else
@@ -1593,21 +1587,25 @@ _install_sing_box() {
         rm -rf "$temp_dir"
         return 1
     fi
-    local digest_wait=0
-    while [ ! -s "$digest_file" ] && [ "$digest_wait" -lt 50 ]; do
-        sleep 0.1
-        digest_wait=$((digest_wait + 1))
-    done
-    expected="${asset_digest#sha256:}"
-    if command -v sha256sum &>/dev/null; then
-        actual=$(awk '{print $1}' "$digest_file" 2>/dev/null)
-    else
-        actual=$(awk '{print $NF}' "$digest_file" 2>/dev/null)
-    fi
-    if [ -z "$expected" ] || [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-        _error "sing-box 安装包 SHA-256 校验失败，已拒绝替换核心。"
-        rm -rf "$temp_dir"
-        return 1
+    
+    # 如果 API 提供了摘要，则严格复核
+    if [[ "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        local digest_wait=0
+        while [ ! -s "$digest_file" ] && [ "$digest_wait" -lt 50 ]; do
+            sleep 0.1
+            digest_wait=$((digest_wait + 1))
+        done
+        expected="${asset_digest#sha256:}"
+        if command -v sha256sum &>/dev/null; then
+            actual=$(awk '{print $1}' "$digest_file" 2>/dev/null)
+        else
+            actual=$(awk '{print $NF}' "$digest_file" 2>/dev/null)
+        fi
+        if [ -n "$expected" ] && [ -n "$actual" ] && [ "${expected,,}" != "${actual,,}" ]; then
+            _error "sing-box 安装包 SHA-256 校验失败，已拒绝替换核心。"
+            rm -rf "$temp_dir"
+            return 1
+        fi
     fi
 
     extracted_bin=$(find "$temp_dir" -name sing-box -type f 2>/dev/null | head -n 1)
@@ -1629,7 +1627,6 @@ _install_sing_box() {
         return 1
     fi
 
-    # 在触碰旧核心之前，用新核心校验真实的双配置组合。
     if [ -s "$CONFIG_FILE" ]; then
         local validation_relay="$RELAY_CONFIG_FILE"
         if [ ! -s "$validation_relay" ]; then
@@ -1649,8 +1646,6 @@ _install_sing_box() {
     staged_bin=$(mktemp "$(dirname "$SINGBOX_BIN")/.sing-box.new.XXXXXX") || { rm -rf "$temp_dir"; return 1; }
     rm -f -- "$staged_bin"
     if ! mv -f -- "$extracted_bin" "$staged_bin"; then
-        # /var/tmp 与安装目录通常位于同一文件系统；跨文件系统时再退回
-        # cp，保证原子替换流程仍可用。
         if ! cp -- "$extracted_bin" "$staged_bin"; then
             rm -f -- "$staged_bin"; rm -rf -- "$temp_dir"; return 1
         fi
@@ -1675,7 +1670,7 @@ _install_sing_box() {
     rm -rf "$temp_dir"
     _release_install_cache
     SINGBOX_STAGED_VERSION="$release_version"
-    _success "sing-box v${release_version} 已安全暂存: ${SINGBOX_BIN}"
+    _success "sing-box-extended v${release_version} 已安全暂存: ${SINGBOX_BIN}"
 }
 
 _rollback_singbox_binary() {
@@ -2054,18 +2049,16 @@ _add_argo_node() {
     case "$protocol" in
         vless) protocol_label="VLESS-WS"; proto_name="Vless" ;;
         trojan) protocol_label="Trojan-WS"; proto_name="Trojan" ;;
+        vless-xhttp-enc) protocol_label="VLESS-XHTTP-ENC-Vision"; proto_name="Vless-XHTTP-ENC" ;;
+        vless-ws-enc) protocol_label="VLESS-WS-ENC-Vision"; proto_name="Vless-WS-ENC" ;;
         *) _error "不支持的 Argo 协议: $protocol"; return 1 ;;
     esac
 
     _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
-
-    # 安装 cloudflared
     _install_cloudflared || return 1
 
-    # === [公共] 内部端口分配 ===
     read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
     local port="$input_port"
-
     while true; do
         if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
             _check_port_conflict "$port" "tcp" && port="" && continue
@@ -2073,14 +2066,12 @@ _add_argo_node() {
             break
         else
             [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
-            # 使用内建算法生成随机端口 (10000-60000)，移除 shuf 依赖
             port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
             _info "正在尝试分配随机内部端口: ${port}..."
         fi
     done
 
-    # === [公共] WebSocket 路径 ===
-    read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
+    read -p "请输入传输路径 (回车随机生成): " ws_path
     if [ -z "$ws_path" ]; then
         ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
         _info "已生成随机路径: ${ws_path}"
@@ -2088,7 +2079,6 @@ _add_argo_node() {
         [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
     fi
 
-    # === [协议特定] Trojan 密码输入 ===
     local password=""
     if [ "$protocol" == "trojan" ]; then
         read -p "请输入 Trojan 密码 (回车随机生成): " password
@@ -2098,7 +2088,6 @@ _add_argo_node() {
         fi
     fi
 
-    # === [公共] 隧道模式选择 ===
     echo ""
     echo "请选择隧道模式:"
     echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定，重启失效)"
@@ -2113,27 +2102,15 @@ _add_argo_node() {
     if [ "$tunnel_mode" == "2" ]; then
         argo_type="fixed"
         _info "您选择了 [固定隧道] 模式。"
-        echo ""
-        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴CF网页端所给出的任何安装命令):"
         read -p "Token: " input_token
-        # 自动提取 Token
         token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
-        if [ -z "$token" ]; then
-             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
-        fi
-        if [ -z "$token" ]; then
-             token="$input_token"
-        fi
-
+        [ -z "$token" ] && token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
+        [ -z "$token" ] && token="$input_token"
         if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
-        _info "已识别 Token (前20位): ${token:0:20}..."
 
-        echo ""
-        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
         read -p "域名 (例如 tunnel.example.com): " input_domain
         if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
         tunnel_domain="$input_domain"
-
         echo ""
         _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
         _info "  Public Hostname: ${tunnel_domain}"
@@ -2141,86 +2118,65 @@ _add_argo_node() {
         echo ""
         read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
         echo ""
-    else
-        _info "您选择了 [临时隧道] 模式。"
     fi
 
-    # === [公共] 节点名称 ===
     local default_prefix="Argo-Temp"
-    if [ "$argo_type" == "fixed" ]; then
-        default_prefix="Argo-Fixed"
-    fi
+    [ "$argo_type" == "fixed" ] && default_prefix="Argo-Fixed"
     local default_name="${default_prefix}-${proto_name}-${port}"
-
-    echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
 
-    # === [协议特定] 生成凭据、tag 和 Inbound ===
-    local tag="argo-${protocol}-ws-${port}"
+    local tag="argo-${protocol}-${port}"
     local uuid=""
     local inbound_json=""
+    local client_encryption="" server_decryption=""
+
+    # 针对需要 ENC 的模式生成 X25519 密钥
+    if [[ "$protocol" == "vless-xhttp-enc" || "$protocol" == "vless-ws-enc" ]]; then
+        uuid=$(${SINGBOX_BIN} generate uuid)
+        local keypair private_key public_key
+        keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+        private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+        public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+        server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+        client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+    fi
 
     if [ "$protocol" == "vless" ]; then
         uuid=$(${SINGBOX_BIN} generate uuid)
         inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "vless",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"uuid": $u, "flow": ""}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
+            --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:""}],transport:{type:"ws",path:$wsp,max_early_data:$ed,early_data_header_name:$edh}}')
+    elif [ "$protocol" == "vless-xhttp-enc" ]; then
+        inbound_json=$(jq -n \
+            --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg xp "$ws_path" \
+            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,mode:"packet-up"}}')
+    elif [ "$protocol" == "vless-ws-enc" ]; then
+        inbound_json=$(jq -n \
+            --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"ws",path:$wsp,max_early_data:$ed,early_data_header_name:$edh}}')
     elif [ "$protocol" == "trojan" ]; then
         inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "trojan",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"password": $pw}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
+            --arg t "$tag" --arg p "$port" --arg pw "$password" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{type:"trojan",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{password:$pw}],transport:{type:"ws",path:$wsp,max_early_data:$ed,early_data_header_name:$edh}}')
     fi
 
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
-
-    # === [公共] 重启 + 启动隧道 ===
     _manage_service "restart"
     sleep 2
 
     if [ "$argo_type" == "fixed" ]; then
-        if ! _start_argo_tunnel "$port" "${protocol}-ws" "$token"; then
+        if ! _start_argo_tunnel "$port" "${protocol}" "$token"; then
              _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
              _manage_service "restart"
              return 1
         fi
     else
-        local real_domain=$(_start_argo_tunnel "$port" "${protocol}-ws")
-        if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
+        local real_domain=$(_start_argo_tunnel "$port" "${protocol}")
+        if [ -z "$real_domain" ]; then
             _error "隧道启动失败，正在回滚配置..."
             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
             _manage_service "restart"
@@ -2229,90 +2185,33 @@ _add_argo_node() {
         tunnel_domain="$real_domain"
     fi
 
-    # === [协议特定] 保存元数据 ===
-    local credential_key="" credential_val=""
-    if [ "$protocol" == "vless" ]; then
-        credential_key="uuid"; credential_val="$uuid"
-    else
-        credential_key="password"; credential_val="$password"
-    fi
-
+    # 保存元数据
     local argo_meta=$(jq -n \
-        --arg tag "$tag" \
-        --arg name "$name" \
-        --arg domain "$tunnel_domain" \
-        --arg port "$port" \
-        --arg cred_val "$credential_val" \
-        --arg cred_key "$credential_key" \
-        --arg path "$ws_path" \
-        --arg protocol "${protocol}-ws" \
-        --arg type "$argo_type" \
-        --arg token "$token" \
+        --arg tag "$tag" --arg name "$name" --arg domain "$tunnel_domain" --arg port "$port" \
+        --arg uuid "$uuid" --arg pw "$password" --arg enc "$client_encryption" --arg dec "$server_decryption" \
+        --arg path "$ws_path" --arg protocol "$protocol" --arg type "$argo_type" --arg token "$token" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), ($cred_key): $cred_val, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
-
-    if [ ! -f "$ARGO_METADATA_FILE" ]; then
-        echo '{}' > "$ARGO_METADATA_FILE"
-    fi
+        '{($tag): {name:$name, domain:$domain, local_port:($port|tonumber), uuid:$uuid, password:$pw, encryption:$enc, decryption:$dec, path:$path, protocol:$protocol, type:$type, token:$token, created_at:$created}}')
+    [ ! -f "$ARGO_METADATA_FILE" ] && echo '{}' > "$ARGO_METADATA_FILE"
     _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
 
-    # === [协议特定] Clash 配置 + 分享链接 ===
+    # 生成客户端 Clash 配置
     local proxy_json=""
     if [ "$protocol" == "vless" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "vless",
-                "server": $s,
-                "port": 443,
-                "uuid": $u,
-                "tls": true,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "servername": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
+        proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{name:$n, type:"vless", server:$s, port:443, uuid:$u, tls:true, udp:true, "skip-cert-verify":false, network:"ws", servername:$s, "ws-opts":{path:$wsp, "max-early-data":$ed, "early-data-header-name":$edh, headers:{Host:$s}}}')
+    elif [ "$protocol" == "vless-xhttp-enc" ]; then
+        proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" --arg enc "$client_encryption" --arg xp "$ws_path" \
+            '{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:"xtls-rprx-vision", encryption:$enc, tls:true, udp:true, "skip-cert-verify":false, network:"xhttp", servername:$s, alpn:["h2"], "xhttp-opts":{path:$xp, mode:"packet-up", headers:{Host:$s}}}')
+    elif [ "$protocol" == "vless-ws-enc" ]; then
+        proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" --arg enc "$client_encryption" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:"xtls-rprx-vision", encryption:$enc, tls:true, udp:true, "skip-cert-verify":false, network:"ws", servername:$s, "ws-opts":{path:$wsp, "max-early-data":$ed, "early-data-header-name":$edh, headers:{Host:$s}}}')
     elif [ "$protocol" == "trojan" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "trojan",
-                "server": $s,
-                "port": 443,
-                "password": $pw,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "sni": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
+        proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg pw "$password" --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+            '{name:$n, type:"trojan", server:$s, port:443, password:$pw, udp:true, "skip-cert-verify":false, network:"ws", sni:$s, "ws-opts":{path:$wsp, "max-early-data":$ed, "early-data-header-name":$edh, headers:{Host:$s}}}')
     fi
 
     if ! _add_node_to_yaml "$proxy_json"; then
@@ -2322,9 +2221,6 @@ _add_argo_node() {
         return 1
     fi
 
-    # === [公共] 启用守护 + 显示结果 ===
-    # 守护是 Argo 节点的完整性条件；失败时回滚本次节点，避免产生
-    # 表面创建成功但重启后无法自愈的半成品状态。
     if ! _enable_argo_watchdog; then
         _stop_argo_tunnel "$port"
         _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
@@ -2343,22 +2239,20 @@ _add_argo_node() {
     echo -e "本地端口: ${port}"
     echo "-------------------------------------------"
     
-    # 使用统一链接生成器进行展示与持久化
     if [ "$protocol" == "vless" ]; then
         _show_node_link "vless-ws" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path"
+    elif [ "$protocol" == "vless-xhttp-enc" ]; then
+        _show_node_link "vless-xhttp-argo" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path" "$client_encryption"
+    elif [ "$protocol" == "vless-ws-enc" ]; then
+        _show_node_link "vless-ws-enc-argo" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path" "$client_encryption"
     else
         _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
     fi
-    
     echo "-------------------------------------------"
-    if [ "$argo_type" == "temp" ]; then
-        _warning "注意: 临时隧道每次重启域名会变化！"
-    fi
 }
 
-# 保留原始函数名作为薄包装器，确保向后兼容
-_add_argo_vless_ws() { _add_argo_node "vless"; }
-
+_add_argo_vless_xhttp_enc() { _add_argo_node "vless-xhttp-enc"; }
+_add_argo_vless_ws_enc() { _add_argo_node "vless-ws-enc"; }
 _add_argo_trojan_ws() { _add_argo_node "trojan"; }
 
 _view_argo_nodes() {
@@ -3009,33 +2903,37 @@ _argo_menu() {
         echo -e "  ${CYAN}【创建节点】${NC}"
         echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
         echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
+        echo -e "    ${GREEN}[3]${NC} 创建 VLESS-XHTTP+ENC+Vision + Argo 节点"
+        echo -e "    ${GREEN}[4]${NC} 创建 VLESS-WS+ENC+Vision + Argo 节点"
         echo ""
         
         echo -e "  ${CYAN}【节点管理】${NC}"
-        echo -e "    ${GREEN}[3]${NC} 查看 Argo 节点信息"
-        echo -e "    ${GREEN}[4]${NC} 查看 Argo 隧道日志"
-        echo -e "    ${GREEN}[5]${NC} 删除 Argo 节点"
+        echo -e "    ${GREEN}[5]${NC} 查看 Argo 节点信息"
+        echo -e "    ${GREEN}[6]${NC} 查看 Argo 隧道日志"
+        echo -e "    ${GREEN}[7]${NC} 删除 Argo 节点"
         echo ""
         
         echo -e "  ${CYAN}【隧道控制】${NC}"
-        echo -e "    ${RED}[6]${NC} 卸载 Argo 服务"
-        echo -e "    ${GREEN}[7]${NC} 重启 Argo 隧道"
+        echo -e "    ${RED}[8]${NC} 卸载 Argo 服务"
+        echo -e "    ${GREEN}[9]${NC} 重启 Argo 隧道"
         echo ""
         
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         
-        read -p "  请输入选项 [0-7]: " choice
+        read -p "  请输入选项 [0-9]: " choice
 
         case $choice in
             1) _add_argo_vless_ws ;;
             2) _add_argo_trojan_ws ;;
-            3) _view_argo_nodes ;;
-            4) _view_argo_logs ;;
-            5) _delete_argo_node ;;
-            6) _uninstall_argo ;;
-            7) _restart_argo_tunnel_menu ;;
+            3) _add_argo_vless_xhttp_enc ;;
+            4) _add_argo_vless_ws_enc ;;
+            5) _view_argo_nodes ;;
+            6) _view_argo_logs ;;
+            7) _delete_argo_node ;;
+            8) _uninstall_argo ;;
+            9) _restart_argo_tunnel_menu ;;
             0) break ;;
             *) _error "无效选项" ;;
         esac
@@ -3652,6 +3550,23 @@ _show_node_link() {
             local uuid="$1"
             url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
             ;;
+        "vless-xhttp-enc-tls")
+            # 参数: uuid, sni, xhttp_path, skip_verify, cert_path, enc_key
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" xhttp_path="$3" skip_verify="$4" cert_path="$5" enc_key="$6"
+            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
+            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            ;;
+        "vless-xhttp-argo")
+            # Argo 专用: uuid, path, enc_key
+            local uuid="$1" xhttp_path="$2" enc_key="$3"
+            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&alpn=h2&type=xhttp&mode=packet-up&host=${link_ip}&path=$(_url_encode "$xhttp_path")&sni=${link_ip}#$(_url_encode "$name")"
+            ;;
+        "vless-ws-enc-argo")
+            # Argo 专用: uuid, path, enc_key
+            local uuid="$1" ws_path="$2" enc_key="$3"
+            local ed_path=$(_ws_path_with_early_data "$ws_path")
+            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
+            ;;
         "trojan-ws-tls")
             # 参数: password, sni, ws_path, skip_verify
             local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
@@ -4168,6 +4083,204 @@ _add_vless_grpc_tls() {
 
     local link_ip="$client_server_addr"
     _show_node_link "vless-grpc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$service_name" "$skip_verify" "$cert_path" || return 1
+}
+
+_add_vless_xhttp_enc_tls() {
+    local camouflage_domain=""
+    local port=""
+    local client_server_addr="${server_ip}"
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
+        port="$BATCH_PORT"
+        camouflage_domain="${BATCH_XHTTP_TLS_DOMAIN:-$BATCH_SNI}"
+    else
+        _info "--- VLESS (XHTTP+ENC+Vision+TLS) 设置向导 (CF回源) ---"
+        _info "请输入客户端用于“连接”的地址:"
+        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
+        _info "  - (其他) 您也可以手动输入一个IP或域名"
+        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+        client_server_addr=${connection_address:-$server_ip}
+
+        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+             client_server_addr="[${client_server_addr}]"
+        fi
+
+        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名 (CF回源填绑定域名)。"
+        _info " (例如: xxx.yourdomain.com)"
+        read -p "请输入伪装域名: " camouflage_domain
+        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+
+        while true; do
+            read -p "请输入监听端口 (直连/回源模式下首推 443 端口): " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+    fi
+
+    local client_port="$port"
+    local xhttp_path=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+    else
+        read -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
+        if [ -z "$input_xhttp_path" ]; then
+            xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+            _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
+        else
+            xhttp_path="$input_xhttp_path"
+            [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
+        fi
+    fi
+
+    local tag="vless-xhttp-in-${port}"
+    local cert_path=""
+    local key_path=""
+    local skip_verify=false
+
+    local cert_choice="1"
+    if [ "$BATCH_MODE" = "true" ]; then
+        cert_choice="1"
+    else
+        echo ""
+        echo "请选择证书类型:"
+        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
+        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
+        read -p "请选择 [1-2] (默认: 1): " cert_choice
+        cert_choice=${cert_choice:-1}
+    fi
+
+    if [ "$cert_choice" == "1" ]; then
+        cert_path="${SINGBOX_DIR}/${tag}.pem"
+        key_path="${SINGBOX_DIR}/${tag}.key"
+        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
+        skip_verify=true
+        _info "已生成自签名证书，客户端将跳过证书验证。"
+    else
+        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
+        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
+        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
+
+        read -p "请输入私钥文件 .key 的完整路径: " key_path
+        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
+
+        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
+        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
+            skip_verify=true
+            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
+        fi
+    fi
+
+    local name=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        name="Batch-VLESS-XHTTP-ENC-${port}"
+    else
+        local default_name="VLESS-XHTTP-ENC-${port}"
+        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
+    fi
+
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+
+    # 关键：调用 sing-box 原生 reality-keypair 生成 X25519 密钥
+    local keypair private_key public_key
+    keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+    private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+    public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "VLESS ENC X25519 密钥生成失败！"
+        return 1
+    fi
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg dec "$server_decryption" \
+        --arg cp "$cert_path" \
+        --arg kp "$key_path" \
+        --arg sn "$camouflage_domain" \
+        --arg xp "$xhttp_path" \
+        '{
+            "type": "vless",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"uuid": $u, "flow": "xtls-rprx-vision"}],
+            "decryption": $dec,
+            "tls": {
+                "enabled": true,
+                "server_name": $sn,
+                "alpn": ["h2"],
+                "certificate_path": $cp,
+                "key_path": $kp
+            },
+            "transport": {
+                "type": "xhttp",
+                "path": $xp,
+                "mode": "stream-one"
+            }
+        }')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    local proxy_json=$(jq -n \
+            --arg n "$name" \
+            --arg s "$client_server_addr" \
+            --arg p "$client_port" \
+            --arg u "$uuid" \
+            --arg enc "$client_encryption" \
+            --arg sn "$camouflage_domain" \
+            --arg xp "$xhttp_path" \
+            --arg skip_verify_bool "$skip_verify" \
+            '{
+                "name": $n,
+                "type": "vless",
+                "server": $s,
+                "port": ($p|tonumber),
+                "uuid": $u,
+                "flow": "xtls-rprx-vision",
+                "encryption": $enc,
+                "tls": true,
+                "udp": true,
+                "skip-cert-verify": ($skip_verify_bool == "true"),
+                "network": "xhttp",
+                "servername": $sn,
+                "alpn": ["h2"],
+                "xhttp-opts": {
+                    "path": $xp,
+                    "mode": "stream-one",
+                    "headers": {
+                        "Host": $sn
+                    }
+                }
+            }')
+
+    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+
+    local meta_json=$(jq -n \
+        --arg n "$name" \
+        --arg sn "$camouflage_domain" \
+        --arg enc "$client_encryption" \
+        --arg dec "$server_decryption" \
+        --arg pk "$public_key" \
+        --arg sk "$private_key" \
+        '{name:$n, server_name:$sn, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+
+    _success "VLESS (XHTTP+ENC+Vision+TLS) 节点 [${name}] 添加成功!"
+    _success "客户端连接地址 (server): ${client_server_addr}"
+    _success "客户端连接端口 (port): ${client_port}"
+    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
+    _success "XHTTP 传输路径: ${xhttp_path}"
+    _success "VLESS ENC 加密: ${client_encryption}"
+
+    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
+
+    local link_ip="$client_server_addr"
+    _show_node_link "vless-xhttp-enc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$xhttp_path" "$skip_verify" "$cert_path" "$client_encryption" || return 1
 }
 
 _add_trojan_ws_tls() {
@@ -5956,6 +6069,7 @@ _detect_main_node_variant() {
     jq -r --arg tag "$tag" '
         .inbounds[]? | select(.tag == $tag) |
         if .type == "vless" and (.tls.reality.enabled // false) then "vless-reality"
+        elif .type == "vless" and .transport.type == "xhttp" then "vless-xhttp-enc-tls"
         elif .type == "vless" and .transport.type == "ws" then "vless-ws-tls"
         elif .type == "vless" and .transport.type == "grpc" then "vless-grpc-tls"
         elif .type == "vless" then "vless-tcp"
@@ -6089,6 +6203,18 @@ _refresh_modified_node_artifacts() {
                 _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .servername = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["grpc-opts"]["grpc-service-name"] = env(NODE_SERVICE))' || return 1
                 _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$service_name" "$skip_verify" "$cert_path" || return 1
             fi
+            ;;
+        vless-xhttp-enc-tls)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // false')
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_PATH="$path" NODE_SKIP_VERIFY="$skip_verify" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .servername = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .alpn = ["h2"] | .["xhttp-opts"].path = env(NODE_PATH) | .["xhttp-opts"].mode = "stream-one" | .["xhttp-opts"].headers.Host = env(NODE_SNI))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$path" "$skip_verify" "$cert_path" "$enc_key" || return 1
             ;;
         vless-tcp)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -8621,25 +8747,25 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
     echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
     echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"
-    echo -e "    ${GREEN}[5]${NC} AnyTLS"
-    echo -e "    ${GREEN}[6]${NC} Hysteria2"
-    echo -e "    ${GREEN}[7]${NC} TUICv5"
-    echo -e "    ${GREEN}[8]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
-    echo -e "    ${GREEN}[10]${NC} SOCKS5"
+    echo -e "    ${GREEN}[5]${NC} VLESS + XHTTP + ENC + Vision + TLS (CF回源)"
+    echo -e "    ${GREEN}[6]${NC} AnyTLS"
+    echo -e "    ${GREEN}[7]${NC} Hysteria2"
+    echo -e "    ${GREEN}[8]${NC} TUICv5"
+    echo -e "    ${GREEN}[9]${NC} Shadowsocks"
+    echo -e "    ${GREEN}[10]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[11]${NC} SOCKS5"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[11]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[12]${NC} 批量创建节点"
     echo ""
     
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-11]: " choice
+    read -p "  请输入选项 [0-12]: " choice
 
-    # 如果输入包含逗号或空格，自动进入批量处理模式
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
         _run_main_create_transaction _batch_create_nodes "$choice"
         return $?
@@ -8650,13 +8776,14 @@ _show_add_node_menu() {
         2) _run_main_create_transaction _add_vless_ws_tls ;;
         3) _run_main_create_transaction _add_trojan_ws_tls ;;
         4) _run_main_create_transaction _add_vless_grpc_tls ;;
-        5) _run_main_create_transaction _add_anytls ;;
-        6) _run_main_create_transaction _add_hysteria2 ;;
-        7) _run_main_create_transaction _add_tuic ;;
-        8) _run_main_create_transaction _add_shadowsocks_menu ;;
-        9) _run_main_create_transaction _add_vless_tcp ;;
-        10) _run_main_create_transaction _add_socks ;;
-        11) _run_main_create_transaction _batch_create_nodes ;;
+        5) _run_main_create_transaction _add_vless_xhttp_enc_tls ;;
+        6) _run_main_create_transaction _add_anytls ;;
+        7) _run_main_create_transaction _add_hysteria2 ;;
+        8) _run_main_create_transaction _add_tuic ;;
+        9) _run_main_create_transaction _add_shadowsocks_menu ;;
+        10) _run_main_create_transaction _add_vless_tcp ;;
+        11) _run_main_create_transaction _add_socks ;;
+        12) _run_main_create_transaction _batch_create_nodes ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
