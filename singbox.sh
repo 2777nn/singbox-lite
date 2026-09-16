@@ -1325,7 +1325,7 @@ _install_yq() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
-export SINGBOX_FIXED_VERSION="1.13.21"
+export SINGBOX_FIXED_VERSION="1.13.18-extended-2.6.5"
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -4090,7 +4090,7 @@ _add_vless_xhttp_enc_tls() {
     local port=""
     local client_server_addr="${server_ip}"
 
-    _info "--- VLESS (XHTTP+ENC+Vision+TLS) 设置向导 (CF回源) ---"
+    _info "--- VLESS (XHTTP+ENC+Vision+TLS) 设置向导 ---"
     _info "请输入客户端用于“连接”的地址:"
     _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
     _info "  - (其他) 您也可以手动输入一个IP或域名"
@@ -8725,7 +8725,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
     echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
     echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"
-    echo -e "    ${GREEN}[5]${NC} VLESS + XHTTP + ENC + Vision + TLS (CF回源)"
+    echo -e "    ${GREEN}[5]${NC} VLESS (XHTTP+ENC+Vision+TLS)"
     echo -e "    ${GREEN}[6]${NC} AnyTLS"
     echo -e "    ${GREEN}[7]${NC} Hysteria2"
     echo -e "    ${GREEN}[8]${NC} TUICv5"
