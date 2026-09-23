@@ -753,7 +753,7 @@ _check_combined_config_files() {
     [ -x "$binary" ] || { _error "sing-box 核心不可执行: $binary"; return 1; }
     [ -s "$main_config" ] || { _error "主配置不存在或为空: $main_config"; return 1; }
     [ -s "$relay_config" ] || { _error "中转配置不存在或为空: $relay_config"; return 1; }
-    "$binary" check -c "$main_config" -c "$relay_config"
+    env GOMEMLIMIT="$(_get_mem_limit)MiB" "$binary" check -c "$main_config" -c "$relay_config"
 }
 
 # 将菜单中的传统 DNS 地址表示转换为 sing-box 1.12+ typed server。
