@@ -4162,13 +4162,36 @@ _add_vless_xhttp_enc_tls() {
 
     local uuid=$(${SINGBOX_BIN} generate uuid)
 
-    # 调用原生 reality-keypair 命令生成 X25519 密钥
-    local keypair private_key public_key
-    keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+    local keypair private_key="" public_key=""
+    
+    # 方式 1: 优先尝试通过 sing-box 生成 (兼容 PrivateKey: 与 Private key: 格式，取最后一个字段)
+    if [ -x "${SINGBOX_BIN}" ]; then
+        keypair=$(${SINGBOX_BIN} generate reality-keypair 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+
+    # 方式 2: 如果系统安装了 Xray，可通过 xray x25519 兜底生成
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v xray &>/dev/null; then
+        keypair=$(xray x25519 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+
+    # 方式 3: 如果依然为空，使用 OpenSSL 纯算法原生兜底生成 X25519 密钥对
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            # 提取 32 字节私钥并转为 base64url 无填充格式
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+            # 提取 32 字节公钥并转为 base64url 无填充格式
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        _error "VLESS ENC X25519 密钥生成失败！"
+        _error "VLESS ENC X25519 密钥生成失败！(sing-box/xray/openssl 均无法生成有效密钥)"
         return 1
     fi
     local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
