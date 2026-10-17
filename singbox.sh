@@ -15,7 +15,7 @@ SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_FIXED_VERSION="1.13.18-extended-2.6.5"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/extended"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/test"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
@@ -3556,6 +3556,11 @@ _show_node_link() {
             local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
             url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
+        "vless-xhttp-enc")
+            # 参数: uuid, host, xhttp_path, enc_key
+            local uuid="$1" host="${2:-$DEFAULT_SNI}" xhttp_path="$3" enc_key="$4"
+            url="vless://${uuid}@${link_ip}:443?security=tls&alpn=h2&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&host=${host}&sni=${host}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000#$(_url_encode "$name")"
+            ;;
         "vless-xhttp-argo")
             # Argo 专用: uuid, path, enc_key
             local uuid="$1" xhttp_path="$2" enc_key="$3"
@@ -4282,6 +4287,175 @@ _add_vless_xhttp_enc_tls() {
 
     local link_ip="$client_server_addr"
     _show_node_link "vless-xhttp-enc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$xhttp_path" "$skip_verify" "$cert_path" "$client_encryption"
+}
+
+_show_xhttp_flexible_guidance() {
+    local domain="$1"
+    local port="$2"
+    echo ""
+    echo -e "${YELLOW}══════════════════ 🔧 Cloudflare Flexible 回源配置说明 ══════════════════${NC}"
+    _info "该节点已开启【客户端->CF走TLS(443)，CF->源站无TLS(ENC加密)】模式："
+    _info "1. ${CYAN}【CF 后台】${NC}域名解析开启小黄云 (${ORANGE}Proxied${NC})。"
+    _info "2. ${CYAN}【CF 后台】${NC}[SSL/TLS] 模式务必设置为: ${GREEN}Flexible (灵活)${NC}。"
+    if [ "$port" != "80" ]; then
+        _warn "3. 您当前源站监听端口为: ${port}。"
+        _warn "   - 若直接回源，CF 仅支持默认 HTTP 端口: 80, 8080, 8880, 2052, 2082, 2086, 2095。"
+        _warn "   - 若使用其他任意端口，请在 CF 后台 [Rules] -> [Origin Rules] 设置重写目标端口到: ${port}。"
+    else
+        _info "3. 当前已监听标准 HTTP 80 端口，Cloudflare 默认可直接回源。"
+    fi
+    _info "4. ${CYAN}【客户端】${NC}分享链接已自动配置为 443 端口与 TLS，您可以直接使用或将地址改为 CF 优选 IP。"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════════${NC}"
+}
+
+_add_vless_xhttp_enc() {
+    local host_domain=""
+    local port=""
+    local client_server_addr=""
+
+    _info "--- VLESS (XHTTP+ENC+Vision 无TLS CF回源) 设置向导 ---"
+    _info "请输入您的“CF 回源域名” (Cloudflare 上解析绑定的域名):"
+    read -p "请输入域名 (例如: vless.example.com): " host_domain
+    [[ -z "$host_domain" ]] && _error "域名不能为空" && return 1
+
+    _info "请输入客户端连接地址:"
+    _info "  - 直接回车默认使用域名: ${host_domain}"
+    _info "  - 也可以输入已有的 Cloudflare 优选 IP / 优选域名"
+    read -p "请输入连接地址 (默认: ${host_domain}): " connection_address
+    client_server_addr=${connection_address:-$host_domain}
+
+    if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+         client_server_addr="[${client_server_addr}]"
+    fi
+
+    while true; do
+        read -p "请输入源站监听端口 (CF 默认回源建议 80 或自选其他端口): " port
+        [[ -z "$port" ]] && _error "端口不能为空" && continue
+        _check_port_conflict "$port" "tcp" && continue
+        break
+    done
+
+    local xhttp_path=""
+    read -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
+    if [ -z "$input_xhttp_path" ]; then
+        xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
+    else
+        xhttp_path="$input_xhttp_path"
+        [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
+    fi
+
+    local tag="vless-xhttp-in-${port}"
+    local default_name="VLESS-XHTTP-ENC-CF-${port}"
+    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+
+    # 生成 X25519 密钥对
+    local keypair private_key="" public_key=""
+    if [ -x "${SINGBOX_BIN}" ]; then
+        keypair=$(${SINGBOX_BIN} generate reality-keypair 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v xray &>/dev/null; then
+        keypair=$(xray x25519 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "VLESS ENC X25519 密钥生成失败！"
+        return 1
+    fi
+
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+
+    # 服务端 Inbound: 无 TLS，不配置 mode (服务端自适应所有 xhttp 模式)
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg dec "$server_decryption" \
+        --arg xp "$xhttp_path" \
+        '{
+            "type": "vless",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"uuid": $u, "flow": "xtls-rprx-vision"}],
+            "decryption": $dec,
+            "transport": {
+                "type": "xhttp",
+                "path": $xp,
+                "x_padding_bytes": "100-1000"
+            }
+        }')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    # 客户端配置 (Clash Meta / Mihomo): 连接 CF 443 + TLS，mode 为 stream-one
+    local proxy_json=$(jq -n \
+            --arg n "$name" \
+            --arg s "$client_server_addr" \
+            --arg u "$uuid" \
+            --arg enc "$client_encryption" \
+            --arg host "$host_domain" \
+            --arg xp "$xhttp_path" \
+            '{
+                "name": $n,
+                "type": "vless",
+                "server": $s,
+                "port": 443,
+                "uuid": $u,
+                "flow": "xtls-rprx-vision",
+                "encryption": $enc,
+                "tls": true,
+                "udp": true,
+                "skip-cert-verify": false,
+                "servername": $host,
+                "alpn": ["h2"],
+                "network": "xhttp",
+                "xhttp-opts": {
+                    "path": $xp,
+                    "mode": "stream-one",
+                    "headers": {
+                        "Host": $host
+                    }
+                }
+            }')
+    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+
+    # 保存元数据
+    local meta_json=$(jq -n \
+        --arg n "$name" \
+        --arg host "$host_domain" \
+        --arg enc "$client_encryption" \
+        --arg dec "$server_decryption" \
+        --arg pk "$public_key" \
+        --arg sk "$private_key" \
+        '{name:$n, host:$host, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
+
+    echo ""
+    _success "VLESS (XHTTP+ENC+Vision 无TLS源站) 节点 [${name}] 添加成功!"
+    _success "VPS 源站监听端口: ${port}"
+    _success "CF 回源 Host/SNI: ${host_domain}"
+    _success "客户端连接端口: 443 (已启用 TLS/H2)"
+    _success "XHTTP 默认模式: stream-one"
+    _show_xhttp_flexible_guidance "${host_domain}" "${port}"
+
+    local link_ip="$client_server_addr"
+    _show_node_link "vless-xhttp-enc" "$name" "$link_ip" "443" "$tag" "$uuid" "$host_domain" "$xhttp_path" "$client_encryption" || return 1
 }
 
 _add_trojan_ws_tls() {
@@ -5493,6 +5667,18 @@ _view_nodes() {
                     local sn="$tls_sn"
                     local fp="chrome"
                     url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
+                elif [ "$transport_type" == "xhttp" ]; then
+                    local xp=$(echo "$node" | jq -r '.transport.path // "/"')
+                    local enc_key=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$METADATA_FILE")
+                    if [ "$tls_enabled" == "true" ]; then
+                        local sn="$tls_sn"
+                        url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sn}&path=$(_url_encode "$xp")&x_padding_bytes=100-1000&sni=${sn}#$(_url_encode "$display_name")"
+                    else
+                        local host=$(jq -r --arg t "$tag" '.[$t].host // empty' "$METADATA_FILE")
+                        [ -z "$host" ] || [ "$host" == "null" ] && host=$(_get_proxy_field "$proxy_name_to_find" '.servername // .["xhttp-opts"].headers.Host // ""')
+                        [ -z "$host" ] && host="$DEFAULT_SNI"
+                        url="vless://${uuid}@${link_ip}:443?security=tls&alpn=h2&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&host=${host}&sni=${host}&path=$(_url_encode "$xp")&x_padding_bytes=100-1000#$(_url_encode "$display_name")"
+                    fi
                 elif [ "$transport_type" == "ws" ]; then
                     # ws_path 已在上方合并提取
                     local sn="$tls_sn"
@@ -6070,7 +6256,8 @@ _detect_main_node_variant() {
     jq -r --arg tag "$tag" '
         .inbounds[]? | select(.tag == $tag) |
         if .type == "vless" and (.tls.reality.enabled // false) then "vless-reality"
-        elif .type == "vless" and .transport.type == "xhttp" then "vless-xhttp-enc-tls"
+        elif .type == "vless" and .transport.type == "xhttp" and (.tls.enabled // false) then "vless-xhttp-enc-tls"
+        elif .type == "vless" and .transport.type == "xhttp" then "vless-xhttp-enc"
         elif .type == "vless" and .transport.type == "ws" then "vless-ws-tls"
         elif .type == "vless" and .transport.type == "grpc" then "vless-grpc-tls"
         elif .type == "vless" then "vless-tcp"
@@ -6217,6 +6404,17 @@ _refresh_modified_node_artifacts() {
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .servername = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .alpn = ["h2"] | .["xhttp-opts"].path = env(NODE_PATH) | .["xhttp-opts"].mode = "stream-one" | .["xhttp-opts"].headers.Host = env(NODE_SNI))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$path" "$skip_verify" "$cert_path" "$enc_key" || return 1
             ;;
+        vless-xhttp-enc)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            host=$(jq -r --arg tag "$tag" '.[$tag].host // empty' "$METADATA_FILE")
+            [ -n "$host" ] || host=$(_get_proxy_field "$name" '.servername // .["xhttp-opts"].headers.Host // ""')
+            [ -n "$host" ] || host="$DEFAULT_SNI"
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            export NODE_UUID="$uuid" NODE_HOST="$host" NODE_PATH="$path" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .port = 443 | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .tls = true | .alpn = ["h2"] | .servername = env(NODE_HOST) | ."skip-cert-verify" = false | .["xhttp-opts"].path = env(NODE_PATH) | .["xhttp-opts"].mode = "stream-one" | .["xhttp-opts"].headers.Host = env(NODE_HOST))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "443" "$tag" "$uuid" "$host" "$path" "$enc_key" || return 1
+            ;;
         vless-tcp)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
             export NODE_UUID="$uuid"
@@ -6322,6 +6520,8 @@ _refresh_modified_node_artifacts() {
             --arg tag "$tag" --arg sni "${sni:-}" --arg mode "$cert_mode" --arg cert "$cert_path" --arg key "$key_path" --arg sha "$cert_sha" --arg skip "${skip_verify:-false}" || return 1
     elif [ -n "${sni:-}" ]; then
         _atomic_modify_json "$METADATA_FILE" '.[$tag].serverName = $sni' --arg tag "$tag" --arg sni "$sni" || return 1
+    elif [ "$variant" = "vless-xhttp-enc" ] && [ -n "${host:-}" ]; then
+        _atomic_modify_json "$METADATA_FILE" '.[$tag].host = $host' --arg tag "$tag" --arg host "$host" || return 1
     fi
 }
 
@@ -6992,6 +7192,13 @@ _modify_node_apply() (
                 shadowsocks-shadowtls)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' --arg tag "$tag" --arg sni "$arg1" || return 1
                     ;;
+                    vless-xhttp-enc)
+                    _atomic_modify_json "$METADATA_FILE" '.[$tag].host = $host' --arg tag "$tag" --arg host "$arg1" || return 1
+                    if [ -n "$old_proxy_name" ]; then
+                        export OLD_NAME="$old_proxy_name" NODE_HOST="$arg1"
+                        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME))) |= (.servername = env(NODE_HOST) | .["xhttp-opts"].headers.Host = env(NODE_HOST))' || return 1
+                    fi
+                    ;;
                 vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
                     local cert_path key_path skip_verify
                     if [ "$arg2" = "self_signed" ]; then
@@ -7019,7 +7226,7 @@ _modify_node_apply() (
             ;;
         transport)
             case "$variant" in
-                vless-ws-tls|trojan-ws-tls)
+                vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.path) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 vless-grpc-tls)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.service_name) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
@@ -7194,11 +7401,12 @@ _modify_node() {
     esac
     case "$variant" in
         vless-reality|any-reality|shadowsocks-shadowtls) echo "  5) 修改伪装域名/SNI" ;;
-        vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic) echo "  5) 修改 SNI 与证书" ;;
+        vless-xhttp-enc) echo "  5) 修改 CF 回源域名(Host/SNI)" ;;
+        vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic|vless-xhttp-enc-tls) echo "  5) 修改 SNI 与证书" ;;
     esac
     case "$variant" in
         vless-reality|any-reality) echo "  6) 重新生成 Reality 密钥和 Short ID" ;;
-        vless-ws-tls|trojan-ws-tls) echo "  6) 修改 WebSocket 路径" ;;
+        vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc) echo "  6) 修改传输路径 (Path)" ;;
         vless-grpc-tls) echo "  6) 修改 gRPC serviceName" ;;
         hysteria2) echo "  6) 修改 Salamander 混淆"; echo "  7) 修改端口跳跃"; echo "  8) 修改客户端带宽参数" ;;
     esac
@@ -7267,6 +7475,13 @@ _modify_node() {
                     current=$(printf '%s' "$expected_node" | jq -r '.handshake.server // empty')
                     read -r -p "请输入新伪装域名 (当前: ${current}): " value
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "伪装域名格式无效。"; return 1; }
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
+                    ;;
+                vless-xhttp-enc)
+                    current=$(jq -r --arg tag "$tag" '.[$tag].host // empty' "$METADATA_FILE")
+                    [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.servername // .["xhttp-opts"].headers.Host // ""')
+                    read -r -p "请输入新回源域名 (当前: ${current}): " value
+                    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
                     ;;
                 vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
@@ -8749,24 +8964,21 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
     echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"
     echo -e "    ${GREEN}[5]${NC} VLESS (XHTTP+ENC+Vision+TLS)"
-    echo -e "    ${GREEN}[6]${NC} AnyTLS"
-    echo -e "    ${GREEN}[7]${NC} Hysteria2"
-    echo -e "    ${GREEN}[8]${NC} TUICv5"
-    echo -e "    ${GREEN}[9]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[10]${NC} VLESS (TCP)"
-    echo -e "    ${GREEN}[11]${NC} SOCKS5"
+    echo -e "    ${GREEN}[6]${NC} VLESS (XHTTP+ENC+Vision 无TLS源站/CF回源)"
+    echo -e "    ${GREEN}[7]${NC} AnyTLS"
+    echo -e "    ${GREEN}[8]${NC} Hysteria2"
+    echo -e "    ${GREEN}[9]${NC} TUICv5"
+    echo -e "    ${GREEN}[10]${NC} Shadowsocks"
+    echo -e "    ${GREEN}[11]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[12]${NC} SOCKS5"
     echo ""
-    
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[12]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[13]${NC} 批量创建节点"
     echo ""
-    
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    
-    read -p "  请输入选项 [0-12]: " choice
-
+    read -p "  请输入选项 [0-13]: " choice
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
         _run_main_create_transaction _batch_create_nodes "$choice"
         return $?
@@ -8778,13 +8990,14 @@ _show_add_node_menu() {
         3) _run_main_create_transaction _add_trojan_ws_tls ;;
         4) _run_main_create_transaction _add_vless_grpc_tls ;;
         5) _run_main_create_transaction _add_vless_xhttp_enc_tls ;;
-        6) _run_main_create_transaction _add_anytls ;;
-        7) _run_main_create_transaction _add_hysteria2 ;;
-        8) _run_main_create_transaction _add_tuic ;;
-        9) _run_main_create_transaction _add_shadowsocks_menu ;;
-        10) _run_main_create_transaction _add_vless_tcp ;;
-        11) _run_main_create_transaction _add_socks ;;
-        12) _run_main_create_transaction _batch_create_nodes ;;
+        6) _run_main_create_transaction _add_vless_xhttp_enc ;;
+        7) _run_main_create_transaction _add_anytls ;;
+        8) _run_main_create_transaction _add_hysteria2 ;;
+        9) _run_main_create_transaction _add_tuic ;;
+        10) _run_main_create_transaction _add_shadowsocks_menu ;;
+        11) _run_main_create_transaction _add_vless_tcp ;;
+        12) _run_main_create_transaction _add_socks ;;
+        13) _run_main_create_transaction _batch_create_nodes ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
