@@ -7484,7 +7484,7 @@ _modify_node() {
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
                     ;;
-                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
+                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic|vless-xhttp-enc-tls)
                     current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // empty')
                     [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.sni // .servername // ""')
                     read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
@@ -7515,12 +7515,11 @@ _modify_node() {
                     [[ "$confirm" =~ ^[Yy]$ ]] || return
                     _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" reality_keys
                     ;;
-                vless-ws-tls|trojan-ws-tls)
+                vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc)
                     current=$(printf '%s' "$expected_node" | jq -r '.transport.path // "/"')
-                    read -r -p "请输入新 WebSocket 路径 (当前: ${current}): " value
+                    read -r -p "请输入新传输路径 (当前: ${current}): " value
                     [ -n "$value" ] || { _error "路径不能为空。"; return 1; }; [[ "$value" == /* ]] || value="/$value"
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" transport "$value"
-                    ;;
                 vless-grpc-tls)
                     current=$(printf '%s' "$expected_node" | jq -r '.transport.service_name // empty')
                     read -r -p "请输入新 gRPC serviceName (当前: ${current}): " value
