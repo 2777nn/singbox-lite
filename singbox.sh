@@ -7673,6 +7673,7 @@ _modify_node() {
                     read -r -p "请输入新传输路径 (当前: ${current}): " value
                     [ -n "$value" ] || { _error "路径不能为空。"; return 1; }; [[ "$value" == /* ]] || value="/$value"
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" transport "$value"
+                    ;;
                 vless-grpc-tls)
                     current=$(printf '%s' "$expected_node" | jq -r '.transport.service_name // empty')
                     read -r -p "请输入新 gRPC serviceName (当前: ${current}): " value
