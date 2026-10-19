@@ -3550,6 +3550,11 @@ _show_node_link() {
             local uuid="$1"
             url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
             ;;
+        "vless-enc-tcp")
+            # 参数: uuid, enc_key, flow
+            local uuid="$1" enc_key="$2" flow="${3:-xtls-rprx-vision}"
+            url="vless://${uuid}@${link_ip}:${port}?encryption=${enc_key}&flow=${flow}&type=tcp#$(_url_encode "$name")"
+            ;;
         "vless-xhttp-enc-tls")
             # 参数: uuid, sni, xhttp_path, skip_verify, cert_path, enc_key
             local uuid="$1" sni="${2:-$DEFAULT_SNI}" xhttp_path="$3" skip_verify="$4" cert_path="$5" enc_key="$6"
@@ -5000,6 +5005,121 @@ _add_vless_reality() {
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id" || return 1
 }
 
+_add_vless_enc_tcp() {
+    local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local port=""
+    local name=""
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        port="$BATCH_PORT"
+        [ -z "$node_ip" ] && node_ip="$server_ip"
+    else
+        _info "--- VLESS (TCP + ENC + Vision) 设置向导 ---"
+        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        node_ip=${custom_ip:-$server_ip}
+        while true; do
+            read -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+    fi
+
+    local default_name="VLESS-ENC-TCP-${port}"
+    if [ "$BATCH_MODE" = "true" ]; then
+        name="Batch-VLESS-ENC-${port}"
+    else
+        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
+    fi
+
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+    local tag="vless-enc-in-${port}"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"
+    [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+
+    # 生成 X25519 密钥对
+    local keypair private_key="" public_key=""
+    if [ -x "${SINGBOX_BIN}" ]; then
+        keypair=$(${SINGBOX_BIN} generate reality-keypair 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v xray &>/dev/null; then
+        keypair=$(xray x25519 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "VLESS ENC X25519 密钥生成失败！"
+        return 1
+    fi
+
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+
+    # Inbound: 纯 TCP + Vision + Decryption (无 TLS)
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg dec "$server_decryption" \
+        '{
+            "type": "vless",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"uuid": $u, "flow": "xtls-rprx-vision"}],
+            "decryption": $dec
+        }')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    # Mihomo / Clash Meta 客户端配置
+    local proxy_json=$(jq -n \
+        --arg n "$name" \
+        --arg s "$yaml_ip" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg enc "$client_encryption" \
+        '{
+            "name": $n,
+            "type": "vless",
+            "server": $s,
+            "port": ($p|tonumber),
+            "uuid": $u,
+            "network": "tcp",
+            "tls": false,
+            "flow": "xtls-rprx-vision",
+            "encryption": $enc,
+            "udp": true
+        }')
+    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+
+    # 保存元数据
+    local meta_json=$(jq -n \
+        --arg n "$name" \
+        --arg enc "$client_encryption" \
+        --arg dec "$server_decryption" \
+        --arg pk "$public_key" \
+        --arg sk "$private_key" \
+        '{name:$n, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+
+    _success "VLESS (ENC + XTLS-Vision 纯TCP) 落地节点 [${name}] 添加成功!"
+    _show_node_link "vless-enc-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid" "$client_encryption" || return 1
+}
+
 _add_vless_tcp() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
@@ -5709,6 +5829,9 @@ _view_nodes() {
                 elif [ "$tls_enabled" == "true" ]; then
                     local sn="$tls_sn"
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                elif echo "$node" | jq -e '.decryption != null' >/dev/null 2>&1; then
+                    local enc_key=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$METADATA_FILE")
+                    url="vless://${uuid}@${link_ip}:${port}?encryption=${enc_key}&flow=xtls-rprx-vision&type=tcp#$(_url_encode "$display_name")"
                 else
                     url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$display_name")"
                 fi
@@ -6260,6 +6383,7 @@ _detect_main_node_variant() {
         elif .type == "vless" and .transport.type == "xhttp" then "vless-xhttp-enc"
         elif .type == "vless" and .transport.type == "ws" then "vless-ws-tls"
         elif .type == "vless" and .transport.type == "grpc" then "vless-grpc-tls"
+        elif .type == "vless" and (.decryption != null) then "vless-enc-tcp"
         elif .type == "vless" then "vless-tcp"
         elif .type == "trojan" and .transport.type == "ws" then "trojan-ws-tls"
         elif .type == "anytls" and (.tls.reality.enabled // false) then "any-reality"
@@ -6414,6 +6538,14 @@ _refresh_modified_node_artifacts() {
             export NODE_UUID="$uuid" NODE_HOST="$host" NODE_PATH="$path" NODE_ENC="$enc_key"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .port = 443 | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .tls = true | .alpn = ["h2"] | .servername = env(NODE_HOST) | ."skip-cert-verify" = false | .["xhttp-opts"].path = env(NODE_PATH) | .["xhttp-opts"].mode = "stream-one" | .["xhttp-opts"].headers.Host = env(NODE_HOST))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "443" "$tag" "$uuid" "$host" "$path" "$enc_key" || return 1
+            ;;
+        vless-enc-tcp)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            [ -n "$enc_key" ] || { _error "ENC 密钥元数据缺失，无法重建客户端配置。"; return 1; }
+            export NODE_UUID="$uuid" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .network = "tcp" | .tls = false | .udp = true)' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$enc_key" || return 1
             ;;
         vless-tcp)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -7249,6 +7381,21 @@ _modify_node_apply() (
             _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {publicKey:$public,shortId:$sid})' --arg tag "$tag" --arg public "$public_key" --arg sid "$short_id" || return 1
             restart_needed=1
             ;;
+        enc_keys)
+            [ "$variant" = "vless-enc-tcp" ] || return 1
+            local keypair private_key public_key
+            keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+            private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+            public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+            [ -n "$private_key" ] && [ -n "$public_key" ] || { _error "ENC 密钥生成失败。"; return 1; }
+            local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+            local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+            _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .decryption) = $dec' \
+                --arg tag "$tag" --arg dec "$server_decryption" || return 1
+            _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk})' \
+                --arg tag "$tag" --arg enc "$client_encryption" --arg dec "$server_decryption" --arg pk "$public_key" --arg sk "$private_key" || return 1
+            restart_needed=1
+            ;;
         hy2_obfs)
             [ "$variant" = "hysteria2" ] || return 1
             if [ -n "$arg1" ]; then
@@ -7406,6 +7553,7 @@ _modify_node() {
     esac
     case "$variant" in
         vless-reality|any-reality) echo "  6) 重新生成 Reality 密钥和 Short ID" ;;
+        vless-enc-tcp) echo "  6) 重新生成 ENC 密钥对" ;;
         vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc) echo "  6) 修改传输路径 (Path)" ;;
         vless-grpc-tls) echo "  6) 修改 gRPC serviceName" ;;
         hysteria2) echo "  6) 修改 Salamander 混淆"; echo "  7) 修改端口跳跃"; echo "  8) 修改客户端带宽参数" ;;
@@ -7514,6 +7662,11 @@ _modify_node() {
                     read -r -p "重新生成后旧客户端将立即失效，确认继续？[y/N]: " confirm
                     [[ "$confirm" =~ ^[Yy]$ ]] || return
                     _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" reality_keys
+                    ;;
+                vless-enc-tcp)
+                    read -r -p "重新生成后旧客户端将立即失效，确认继续？[y/N]: " confirm
+                    [[ "$confirm" =~ ^[Yy]$ ]] || return
+                    _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" enc_keys
                     ;;
                 vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc)
                     current=$(printf '%s' "$expected_node" | jq -r '.transport.path // "/"')
@@ -8970,14 +9123,15 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[10]${NC} Shadowsocks"
     echo -e "    ${GREEN}[11]${NC} VLESS (TCP)"
     echo -e "    ${GREEN}[12]${NC} SOCKS5"
+    echo -e "    ${GREEN}[13]${NC} VLESS (TCP+ENC+Vision)"
     echo ""
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[13]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[14]${NC} 批量创建节点"
     echo ""
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    read -p "  请输入选项 [0-13]: " choice
+    read -p "  请输入选项 [0-14]: " choice
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
         _run_main_create_transaction _batch_create_nodes "$choice"
         return $?
@@ -8996,7 +9150,8 @@ _show_add_node_menu() {
         10) _run_main_create_transaction _add_shadowsocks_menu ;;
         11) _run_main_create_transaction _add_vless_tcp ;;
         12) _run_main_create_transaction _add_socks ;;
-        13) _run_main_create_transaction _batch_create_nodes ;;
+        13) _run_main_create_transaction _add_vless_enc_tcp ;;
+        14) _run_main_create_transaction _batch_create_nodes ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
