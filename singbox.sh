@@ -14,7 +14,7 @@ export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/test"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/lean"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
