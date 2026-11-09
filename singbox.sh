@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="40"
+export SCRIPT_VERSION="41"
 export DEFAULT_SNI="www.amd.com"
 export CDN_ECH="cloudflare-ech.com%2Bhttps%3A%2F%2Fdoh.pub%2Fdns-query"
 
@@ -831,7 +831,7 @@ _time_prepare_ntp_config_locked() {
         or .ntp == {enabled:true,server:"time.apple.com",server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}
     ' "$CONFIG_FILE" >/dev/null; then
         if _time_has_ss2022; then
-            _info "保留用户自定义 NTP 配置；SS2022 需确认校时成功，主菜单 [11] 可诊断。"
+            _info "保留用户自定义 NTP 配置；SS2022 需确认校时成功，主菜单 [10] 可诊断。"
             if ! jq -e '.ntp.enabled == true' "$CONFIG_FILE" >/dev/null; then
                 _warn "内置 NTP 已由用户关闭：SS2022 仍依赖系统时间，不能自动补偿宿主机偏差。"
             fi
@@ -2103,6 +2103,16 @@ _memwatch() {
         exec 8>&-
         return 0
     fi
+    # 主脚本正在改配置（持 .singboxlite.lock）时跳过本轮重启，状态文件留着下次再判。
+    if command -v flock >/dev/null 2>&1 && exec 9>"${SINGBOX_DIR}/.singboxlite.lock" 2>/dev/null; then
+        if flock -n 9 2>/dev/null; then
+            exec 9>&-
+        else
+            logger "sing-box-memwatch: 检测到配置锁被占用，延后重启" 2>/dev/null || true
+            exec 9>&- 8>&-
+            return 0
+        fi
+    fi
     logger "sing-box-memwatch: 内存已用 ${pct}% (${used_mb}MB/${total_mb}MB), sing-box ${sb_rss}MB, 连续两次超标, sync 后重启 sing-box 释放" 2>/dev/null || true
     sync 2>/dev/null || true
     rm -f -- "$state_file"
@@ -2739,7 +2749,6 @@ _show_node_link() {
         "vless-xhttp-enc-tls")
             # 参数: uuid, sni, xhttp_path, skip_verify, cert_path, enc_key
             local uuid="$1" sni="${2:-$DEFAULT_SNI}" xhttp_path="$3" skip_verify="$4" cert_path="$5" enc_key="$6"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
             url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${sni}&ech=${CDN_ECH}#$(_url_encode "$name")"
             ;;
         "vless-xhttp-enc")
@@ -5026,7 +5035,7 @@ _modify_port() (
     fi
 
     local proposed_new_tag proposed_new_inner proposed_old_proxy_name proposed_new_proxy_name
-    proposed_new_tag=$(echo "$tag_to_modify" | sed "s/${old_port}/${new_port}/g")
+    proposed_new_tag=$(echo "$tag_to_modify" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
     if [ "$proposed_new_tag" != "$tag_to_modify" ] && jq -e --arg tag "$proposed_new_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "新 tag 已被其他节点占用: $proposed_new_tag"
         return 1
@@ -5039,7 +5048,7 @@ _modify_port() (
         if [[ "$shadowtls_inner_tag" == "$tag_to_modify"* ]]; then
             proposed_new_inner="${proposed_new_tag}${shadowtls_inner_tag#${tag_to_modify}}"
         else
-            proposed_new_inner=$(echo "$shadowtls_inner_tag" | sed "s/${old_port}/${new_port}/g")
+            proposed_new_inner=$(echo "$shadowtls_inner_tag" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
         fi
         if [ "$proposed_new_inner" != "$shadowtls_inner_tag" ] && jq -e --arg tag "$proposed_new_inner" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
             _error "新的 ShadowTLS 内层 tag 已被占用: $proposed_new_inner"
@@ -5076,7 +5085,7 @@ _modify_port() (
             _error "该 Clash 节点名仍被 Argo/Xray/中转共享引用，拒绝原地改名或改端口: $proposed_old_proxy_name"
             return 1
         fi
-        proposed_new_proxy_name=$(echo "$proposed_old_proxy_name" | sed "s/${old_port}/${new_port}/g")
+        proposed_new_proxy_name=$(echo "$proposed_old_proxy_name" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
         if [ "$proposed_new_proxy_name" != "$proposed_old_proxy_name" ]; then
             export PROXY_NAME="$proposed_new_proxy_name"
             if ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$proposed_new_proxy_name"; then
@@ -5139,7 +5148,7 @@ _modify_port() (
             current_meta_name=$(jq -r ".\"$tag_to_modify\".name // \"\"" "$METADATA_FILE")
             if [ -n "$current_meta_name" ]; then
                 local new_meta_name
-                new_meta_name=$(echo "$current_meta_name" | sed "s/${old_port}/${new_port}/g")
+                new_meta_name=$(echo "$current_meta_name" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
                 if [ "$new_meta_name" != "$current_meta_name" ]; then
                     _atomic_modify_json "$METADATA_FILE" '.[$tag].name = $name' --arg tag "$tag_to_modify" --arg name "$new_meta_name" || return
                 fi
@@ -5158,7 +5167,7 @@ _modify_port() (
     fi
 
     # 4. 通用 tag 重命名（所有含端口的 tag 都可能需要更新）
-    local new_tag=$(echo "$tag_to_modify" | sed "s/${old_port}/${new_port}/g")
+    local new_tag=$(echo "$tag_to_modify" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
     if [ "$new_tag" != "$tag_to_modify" ]; then
         # 4a. 处理证书文件重命名（仅 Hysteria2, TUIC, AnyTLS 有独立证书）
         if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ] || [ "$type_to_modify" == "anytls" ]; then
@@ -5180,7 +5189,7 @@ _modify_port() (
             if [[ "$shadowtls_inner_tag" == "$tag_to_modify"* ]]; then
                 new_shadowtls_inner_tag="${new_tag}${shadowtls_inner_tag#${tag_to_modify}}"
             else
-                new_shadowtls_inner_tag=$(echo "$shadowtls_inner_tag" | sed "s/${old_port}/${new_port}/g")
+                new_shadowtls_inner_tag=$(echo "$shadowtls_inner_tag" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
             fi
             _atomic_modify_json "$CONFIG_FILE" '
                 (.inbounds[] | select(.tag == $outer) | .tag) = $new_outer
@@ -5627,10 +5636,30 @@ _modify_node_apply() (
                 . + {($new): ((.[$old] // {}) + {local_port:$port})}
                 | del(.[$old])
             ' --arg old "$tag" --arg new "$new_tag" --argjson port "$new_port" || return 1
+            # 证书按旧 tag 命名（仅 vless-xhttp-enc 有自签证书），改端口时跟着迁，否则删节点会按新 tag 删错文件。
+            local old_cert="${SINGBOX_DIR}/${tag}.pem" old_key="${SINGBOX_DIR}/${tag}.key"
+            local new_cert="${SINGBOX_DIR}/${new_tag}.pem" new_key="${SINGBOX_DIR}/${new_tag}.key"
+            local old_cert_present=0 old_key_present=0
+            { [ -e "$old_cert" ] || [ -L "$old_cert" ]; } && old_cert_present=1
+            { [ -e "$old_key" ] || [ -L "$old_key" ]; } && old_key_present=1
+            if [ "$old_cert_present" -ne "$old_key_present" ]; then
+                _error "旧证书与私钥不成对，拒绝修改端口。"
+                return 1
+            fi
+            if [ "$old_cert_present" -eq 1 ]; then
+                if [ -e "$new_cert" ] || [ -L "$new_cert" ] || [ -e "$new_key" ] || [ -L "$new_key" ]; then
+                    _error "新 tag 对应的证书或私钥路径已存在，拒绝覆盖。"
+                    return 1
+                fi
+                mv -- "$old_cert" "$new_cert" || return 1
+                mv -- "$old_key" "$new_key" || return 1
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.certificate_path) = $cert' --arg tag "$new_tag" --arg cert "$new_cert" || return 1
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.key_path) = $key' --arg tag "$new_tag" --arg key "$new_key" || return 1
+            fi
             # 代理名里带旧端口时跟着改名 (默认名 Argo-XHTTP-<端口>), YAML 端口保持 443 不动。
             if [ -n "$old_proxy_name" ]; then
                 local new_name
-                new_name=$(printf '%s' "$old_proxy_name" | sed "s/${port}/${new_port}/g")
+                new_name=$(printf '%s' "$old_proxy_name" | sed -E "s/(^|[-_ ])${port}$/\1${new_port}/")
                 if [ "$new_name" != "$old_proxy_name" ]; then
                     _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].name = $name' --arg tag "$new_tag" --arg name "$new_name" || return 1
                     export OLD_NAME="$old_proxy_name" NEW_NAME="$new_name"
@@ -5662,6 +5691,7 @@ _modify_node_apply() (
             [ -n "$new_path" ] || { _error "路径不能为空。"; return 1; }
             [[ "$new_path" == /* ]] || new_path="/${new_path}"
             _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.path) = $value' --arg tag "$tag" --arg value "$new_path" || return 1
+            _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].path = $value' --arg tag "$tag" --arg value "$new_path" || return 1
             restart_needed=1
             ;;
         *) _error "未知节点修改动作。"; return 1 ;;
@@ -6027,14 +6057,6 @@ _update_script_locked() {
     local stages=() backups=() had_original=()
     cache_bust=$(date +%s)
     urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
-
-    for script_name in "${names[@]:1}"; do
-        script_path="${SINGBOX_DIR}/${script_name}"
-        # 与实际执行路径一致：开发/当前目录存在时优先更新它，否则更新生产副本。
-        [ -f "${SCRIPT_DIR}/${script_name}" ] && script_path="${SCRIPT_DIR}/${script_name}"
-        targets+=("$script_path")
-        urls+=("${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}")
-    done
 
     _info "正在预下载并校验全部脚本组件..."
     for i in "${!names[@]}"; do
@@ -6945,7 +6967,7 @@ _batch_create_nodes() {
         # 计算 SS 实际需要的端口数
         local ss_needed
         ss_needed=$(printf '%s' "$normalized_ss" | wc -w)
-        # 每个 Shadowsocks 协议 ID (8) 额外需要 (ss_needed - 1) 个端口
+        # 每个 Shadowsocks 协议 ID (9) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
     fi
 
@@ -6955,7 +6977,7 @@ _batch_create_nodes() {
     for planned_pid in $proto_ids; do
         case "$planned_pid" in
             3|4) planned_protocols+=("udp") ;;
-            7)
+            9)
                 for planned_variant in $(echo "$ss_variant" | tr ',' ' '); do
                     planned_protocols+=("tcp+udp")
                 done
