@@ -1273,6 +1273,11 @@ export SINGBOX_BIN="/usr/local/bin/sing-box"
 export SINGBOX_LEAN_REPO="2777nn/sing-box-extended"
 export SINGBOX_LEAN_RELEASE_TAG="release"
 export SINGBOX_LEAN_API_BASE="https://api.github.com/repos/2777nn/sing-box-extended"
+# 核心版本号统一格式: shtorm 旧版 1.14.3-extended-2.7.3 与 MiChongs 新版
+# 1.15.0-alpha.13-xiaobaf14g.11 都认, 资产名 / 锁文件 / 用户输入共用这一份。
+# 二进制内部版本 (sing-box version 输出) 必须与资产名抠出的版本一致,
+# 否则 _install_sing_box 会报"版本与发布不匹配"并拒绝安装。
+export SINGBOX_VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-extended-[0-9.]+|-alpha\.[0-9]+-xiaobaf14g\.[0-9]+)$'
 # 锁定文件内容即锁定的已装版本号 (如 1.14.3-extended-2.7.3), 不再硬编码固定版。
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
@@ -1423,9 +1428,9 @@ _singbox_core_is_locked() {
 }
 
 _write_singbox_core_lock() {
-    # 锁定当前已装版本: $1 为版本号 (如 1.14.3-extended-2.7.3)。
+    # 锁定当前已装版本: $1 为版本号 (如 1.14.3-extended-2.7.3 / 1.15.0-alpha.13-xiaobaf14g.11)。
     local version="${1:-}"
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-extended-[0-9.]+$ ]] || return 1
+    [[ "$version" =~ $SINGBOX_VERSION_RE ]] || return 1
     local tmp
     mkdir -p "$SINGBOX_DIR" || return 1
     tmp=$(mktemp "${SINGBOX_CORE_LOCK_FILE}.tmp.XXXXXX") || return 1
@@ -1441,7 +1446,7 @@ _read_singbox_core_lock() {
     local version=""
     [ -s "$SINGBOX_CORE_LOCK_FILE" ] || return 1
     version=$(head -n 1 "$SINGBOX_CORE_LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-extended-[0-9.]+$ ]] || return 1
+    [[ "$version" =~ $SINGBOX_VERSION_RE ]] || return 1
     printf '%s\n' "$version"
 }
 
@@ -1455,7 +1460,7 @@ _lean_list_versions() {
     curl -fsSL --retry 3 --connect-timeout 10 "${SINGBOX_LEAN_API_BASE}/releases?per_page=30" 2>/dev/null | jq -r '
         [ .[] | select(.draft == false and .prerelease == false)
           | {tag: (.tag_name // ""), published: (.published_at // ""),
-             asset: (.assets[]? | select(.name | test("^sing-box-[0-9]+\\.[0-9]+\\.[0-9]+-extended-[0-9.]+-lean-(amd64|arm64)$")))}
+             asset: (.assets[]? | select(.name | test("^sing-box-[0-9]+\\.[0-9]+\\.[0-9]+(-extended-[0-9.]+|-alpha\\.[0-9]+-xiaobaf14g\\.[0-9]+)-lean-(amd64|arm64)$")))}
           | {version: (.asset.name | sub("^sing-box-"; "") | sub("-lean-(amd64|arm64)$"; "")),
              name: .asset.name, url: (.asset.browser_download_url // ""),
              digest: (.asset.digest // ""), tag: .tag, published: .published}
@@ -1488,8 +1493,8 @@ _install_sing_box() {
     if [ "$requested_version" = "latest" ]; then
         asset_line=$(printf '%s\n' "$versions_tsv" | awk -F'\t' '!seen[$1]++' | head -n 1)
     else
-        [[ "$requested_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-extended-[0-9.]+$ ]] \
-            || { _error "版本号格式无效: ${requested_version} (应为如 1.14.3-extended-2.7.3)"; return 1; }
+        [[ "$requested_version" =~ $SINGBOX_VERSION_RE ]] \
+            || { _error "版本号格式无效: ${requested_version} (应为如 1.14.3-extended-2.7.3 或 1.15.0-alpha.13-xiaobaf14g.11)"; return 1; }
         asset_line=$(printf '%s\n' "$versions_tsv" | awk -F'\t' -v v="$requested_version" '$1 == v && !seen[$1]++' | head -n 1)
         if [ -z "$asset_line" ]; then
             _error "历史版本里没有 v${requested_version}。"
@@ -6273,12 +6278,12 @@ _install_lean_historical() {
     fi
     echo "    [0] 返回"
     echo ""
-    read -r -p "  请选择编号, 或直接输入版本号 (如 1.14.3-extended-2.7.3): " choice
+    read -r -p "  请选择编号, 或直接输入版本号 (如 1.14.3-extended-2.7.3 / 1.15.0-alpha.13-xiaobaf14g.11): " choice
     local target=""
     if [ "$choice" = "0" ]; then return 0; fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#vers[@]}" ]; then
         target="${vers[$((choice - 1))]}"
-    elif [[ "$choice" =~ ^[0-9]+\.[0-9]+\.[0-9]+-extended-[0-9.]+$ ]]; then
+    elif [[ "$choice" =~ $SINGBOX_VERSION_RE ]]; then
         target="$choice"
     else
         _error "无效输入。"
@@ -6305,6 +6310,7 @@ _do_update_singbox() {
     case "$install_target" in
         latest) ;;
         [0-9]*-extended-*) ;;
+        [0-9]*-alpha.*-xiaobaf14g.*) ;;
         *) _error "无效的 sing-box 安装目标: ${install_target}"; return 1 ;;
     esac
 
