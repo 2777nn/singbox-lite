@@ -6,16 +6,19 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="30"
-export DEFAULT_SNI="www.analog.com"
+export SCRIPT_VERSION="44"
+# 默认 SNI 候选池：新建节点回车默认时随机取一个，避免所有节点共用同一 SNI。
+DEFAULT_SNI_POOL=("www.analog.com" "dl-cdn.alpinelinux.org" "deb.debian.org" "crates.io" "pypi.org" "rubygems.org" "addons.mozilla.org" "formulae.brew.sh" "static.rust-lang.org" "cpan.org")
+_pick_random_default_sni() { local _r; _r=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' '); [[ "$_r" =~ ^[0-9]+$ ]] || _r=$RANDOM; printf '%s\n' "${DEFAULT_SNI_POOL[$((_r % ${#DEFAULT_SNI_POOL[@]}))]}"; }
+# DEFAULT_SNI 只做老节点查看/重建链接的固定兼容兜底，新建节点一律显式调 _pick_random_default_sni。
+export DEFAULT_SNI="www.amd.com"
+export CDN_ECH="cloudflare-ech.com%2Bhttps%3A%2F%2Fdoh.pub%2Fdns-query"
+
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
-SINGBOX_DIR="/usr/local/etc/sing-box"
-SINGBOX_FIXED_VERSION="1.14.4"
-SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/2777nn/singbox-lite/lean"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
 # --- 核心工具函数 ---
@@ -35,15 +38,13 @@ _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _warning() { _warn "$1"; } # 别名兼容
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
 
-# 容器名称只用于调整可选依赖；端口转发能力由 advanced_relay.sh 实测。
 # 精简 Podman 容器跳过部分非必要安装，避免低内存环境解包时触发 OOM。
 _is_podman_environment() {
     [ -f /run/.containerenv ] && return 0
     grep -qaE 'libpod|podman' /proc/1/cgroup /proc/1/environ 2>/dev/null
 }
 
-# BusyBox flock 不支持 util-linux 的 -w 参数；两者都支持 -n。
-# 使用短间隔轮询实现有界等待，保证 Alpine 与 Debian 共用同一套锁语义。
+# BusyBox flock 不支持 -w, 用短间隔轮询实现有界等待, 两系统共用同一套锁语义。
 _flock_wait() {
     local fd="$1" timeout="${2:-30}" attempts i
     [[ "$fd" =~ ^[0-9]+$ && "$timeout" =~ ^[0-9]+$ ]] || return 1
@@ -55,8 +56,7 @@ _flock_wait() {
     return 1
 }
 
-# 所有脚本组件约定使用同一把状态锁。外层事务持锁时会导出
-# SINGBOXLITE_LOCK_HELD=1，避免原子写函数重复加锁造成父子死锁。
+# 外层事务持锁时导出 SINGBOXLITE_LOCK_HELD=1, 防原子写函数重复加锁父子死锁。
 _with_state_lock() {
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" = "1" ]; then
         "$@"
@@ -84,6 +84,7 @@ _secure_state_permissions() {
     local path
     for path in \
         "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" \
+        "$WARP_STATE_FILE" "$WARP_ACCOUNT_FILE" "$WARP_PROFILE_FILE" \
         "${SINGBOX_DIR}/relay.json" "${SINGBOX_DIR}/relay_links.json" \
         "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
         "/usr/local/etc/xray/metadata.json"; do
@@ -103,13 +104,7 @@ _check_root() {
 }
 
 # 编解码器 (纯 Bash 稳健实现)
-_url_decode() {
-    local data="${1//+/ }"
-    printf '%b' "${data//%/\\x}"
-}
 _url_encode() {
-    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
-    # jq 是必装依赖，@uri 以字节为单位执行标准 percent-encoding
     printf '%s' "$1" | jq -sRr @uri
 }
 
@@ -139,9 +134,7 @@ _tls_insecure_params() {
     local insecure_param=""
     if [[ "$skip_verify" == "true" ]]; then
         local cert_pcs=$(_cert_sha256_hex "$cert_path")
-        # Xray 已在 2026-06-01 后移除 allowInsecure；同时携带
-        # insecure=1 与 pcs 会让新核心直接拒绝配置。能固定自签叶证书
-        # 时只使用证书指纹，无法计算时才保留旧参数作为兼容兜底。
+        # 新核心同时带 insecure=1 与 pcs 会拒绝配置, 能算叶证书指纹时只用 pcs, 否则保留 insecure=1 兜底。
         if [ -n "$cert_pcs" ]; then
             insecure_param="&pcs=${cert_pcs}"
         else
@@ -151,30 +144,10 @@ _tls_insecure_params() {
     printf '%s' "$insecure_param"
 }
 
-_append_pcs_to_tls_link() {
-    local url="$1"
-    local cert_path="$2"
-    [ -n "$url" ] || return 0
-    [[ "$url" == *"pcs="* ]] && { printf '%s' "$url"; return 0; }
-
-    local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    [ -n "$cert_pcs" ] || { printf '%s' "$url"; return 0; }
-
-    local body="$url"
-    local fragment=""
-    if [[ "$url" == *"#"* ]]; then
-        body="${url%%#*}"
-        fragment="#${url#*#}"
-    fi
-
-    local sep="&"
-    [[ "$body" != *"?"* ]] && sep="?"
-    printf '%s%s%s%s' "$body" "$sep" "pcs=${cert_pcs}" "$fragment"
-}
 
 _ss_base64_encode() {
     # Shadowsocks SIP002 规范要求 Base64 编码不带填充 (No Padding)
-    printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
+    printf '%s' "$1" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '='
 }
 
 # 公网 IP 获取 (带全局缓存)
@@ -205,18 +178,12 @@ _detect_init_system() {
 _check_port_occupied() {
     local port=$1
     local proto=${2:-tcp}
-    if [[ "$proto" == "tcp" ]]; then
-        if command -v ss &>/dev/null; then
-            ss -lnpt | grep -q ":${port} " && return 0
-        else
-            netstat -lnpt | grep -q ":${port} " && return 0
-        fi
-    else
-        if command -v ss &>/dev/null; then
-            ss -lnpu | grep -q ":${port} " && return 0
-        else
-            netstat -lnpu | grep -q ":${port} " && return 0
-        fi
+    local ss_opt="-lnpt" net_opt="-lnpt"
+    [ "$proto" != "tcp" ] && ss_opt="-lnpu" && net_opt="-lnpu"
+    if command -v ss &>/dev/null; then
+        ss $ss_opt 2>/dev/null | awk -v p="$port" 'NR>1 {n=split($4,a,":"); if (a[n]==p) found=1} END {exit !found}' && return 0
+    elif command -v netstat &>/dev/null; then
+        netstat $net_opt 2>/dev/null | awk -v p="$port" 'NR>2 {n=split($4,a,":"); if (a[n]==p) found=1} END {exit !found}' && return 0
     fi
     return 1
 }
@@ -242,60 +209,16 @@ _is_pid_file_running_cmd() {
     _is_pid_running_cmd "$pid" "$pattern"
 }
 
-# direct 服务由三个可独立运行的脚本管理。旧中转进程在下次停止时一并回收。
-_direct_xray_pid() {
-    local action="$1" current_file="$2" binary="$3" config="$4"
-    local file pid stopped_pid="" attempt
-    for file in "$current_file" "$XRAY_LEGACY_PID_FILE"; do
-        [ -f "$file" ] && [ ! -L "$file" ] || continue
-        IFS= read -r pid < "$file" || continue
-        [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != 1 ]] || continue
-        if [ "$pid" != "$stopped_pid" ]; then
-            # 旧路径也可能由另一套 Xray 使用，必须同时匹配程序、命令和配置文件。
-            cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || continue
-            if [ "$action" = status ]; then
-                printf '%s\n' "$pid"
-                return 0
-            fi
-            kill "$pid" 2>/dev/null || { [ ! -d "/proc/$pid" ] || return 1; }
-            for ((attempt=0; attempt<50; attempt++)); do
-                cmp -s "/proc/$pid/cmdline" <(printf '%s\0' "$binary" run -c "$config") || break
-                sleep 0.1
-            done
-            if ((attempt == 50)); then
-                _error "等待 Xray 进程 $pid 停止超时，已保留 PID 文件 $file"
-                return 1
-            fi
-            stopped_pid="$pid"
-        fi
-        rm -f -- "$file" || return 1
-    done
-    [ "$action" = stop ]
-}
-
 _prepare_singbox_runtime_pid() {
-    local legacy_pid_file="/tmp/sing-box.pid"
     mkdir -p "$RUNTIME_DIR" || return 1
     chmod 700 "$RUNTIME_DIR" 2>/dev/null || return 1
-
     if _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"; then
-        rm -f -- "$legacy_pid_file"
         return 0
     fi
     rm -f -- "$PID_FILE"
-
-    # 仅迁移能通过 cmdline 校验的旧 PID，绝不盲信 /tmp 中的内容。
-    if _is_pid_file_running_cmd "$legacy_pid_file" "$SINGBOX_BIN"; then
-        local legacy_pid
-        legacy_pid=$(cat "$legacy_pid_file" 2>/dev/null)
-        printf '%s\n' "$legacy_pid" > "$PID_FILE" || return 1
-        chmod 600 "$PID_FILE" 2>/dev/null || return 1
-    fi
-    rm -f -- "$legacy_pid_file"
 }
 
-# 根据 inbound 类型判断其实际监听的传输层，并允许在改端口时排除自身
-# 及自身的 HY2 原生 hop 子节点。
+# 按 inbound 类型判实际监听传输层, 改端口时排除自身及 HY2 hop 子节点。
 _check_port_in_singbox_file() {
     local file="$1" port="$2" proto="${3:-tcp}" exclude_tag="${4:-}"
     [ -s "$file" ] || return 1
@@ -313,22 +236,6 @@ _check_port_in_singbox_file() {
     ' "$file" >/dev/null 2>&1
 }
 
-_check_port_in_xray_config() {
-    local port="$1" proto="${2:-tcp}"
-    local xray_config="/usr/local/etc/xray/config.json"
-    [ -s "$xray_config" ] || return 1
-    jq -e --argjson port "$port" --arg proto "$proto" '
-        def transports:
-            ((.streamSettings.network // .settings.network // "tcp") | ascii_downcase) as $network
-            | if ($network == "quic" or $network == "udp") then ["udp"]
-              elif ($network == "tcp,udp" or $network == "tcp+udp") then ["tcp", "udp"]
-              elif .protocol == "shadowsocks" then ["tcp", "udp"]
-              else ["tcp"] end;
-        .inbounds[]?
-        | select((.port | tonumber?) == $port)
-        | select(transports | index($proto) != null)
-    ' "$xray_config" >/dev/null 2>&1
-}
 
 _check_port_in_pf_metadata() {
     local port="$1" proto="${2:-tcp}"
@@ -342,14 +249,7 @@ _check_port_in_pf_metadata() {
     ' "$pf_meta" >/dev/null 2>&1
 }
 
-# 兼容旧调用；默认检查主 sing-box 的 TCP 监听。
-_check_port_in_config() {
-    local port="$1" proto="${2:-tcp}" exclude_tag="${3:-}"
-    _check_port_in_singbox_file "$CONFIG_FILE" "$port" "$proto" "$exclude_tag"
-}
-
-# 综合端口碰撞检测：系统监听、主配置、中转配置、Xray、端口转发和
-# HY2 跳跃范围统一检查；TCP/UDP 分开判断。
+# 端口碰撞统一查系统监听、主/中转配置、Xray、端口转发与 HY2 跳跃范围, TCP/UDP 分开判。
 _check_port_conflict() {
     local port="$1" requested_proto="${2:-tcp}" silent="${3:-false}" exclude_tag="${4:-}" skip_system="${5:-false}"
     if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -372,8 +272,6 @@ _check_port_conflict() {
             source="主 sing-box 配置"
         elif _check_port_in_singbox_file "${SINGBOX_DIR}/relay.json" "$port" "$proto" ""; then
             source="中转 relay.json"
-        elif _check_port_in_xray_config "$port" "$proto"; then
-            source="Xray 配置"
         elif _check_port_in_pf_metadata "$port" "$proto"; then
             source="端口转发规则"
         elif [ "$skip_system" != "true" ] && _check_port_occupied "$port" "$proto"; then
@@ -588,10 +486,12 @@ _init_server_ip() {
 _manage_service() {
     local action="$1"
 
-    # 复用已保存的 NTP 设置，首次初始化时才探测并写入脚本管理项。
+    # NTP 查询失败不等于核心退出, 先有界探测再迁移默认配置, 容器可用进程内时间补偿。
     if [[ "$action" == "restart" || "$action" == "start" ]]; then
         _time_prepare_ntp_config || return 1
         _ensure_relay_config || return 1
+        # 低内存档先 sync 刷脏页再起 Go check, 否则 check 撞上脏页高峰被杀会误报配置无效。
+        if [ "$(_get_mem_limit)" -le 40 ]; then sync; fi
         local preflight_result
         if ! preflight_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
             _error "拒绝启动：config.json + relay.json 组合配置无效。"
@@ -606,9 +506,7 @@ _manage_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if [ "$action" == "status" ]; then systemctl status sing-box --no-pager -l; return; fi
-            # Containers and rapid successive management operations can exhaust
-            # systemd's start-rate counter even when the configuration is valid.
-            # Clear the counter before an explicit operator start/restart.
+            # 容器里连续启停会耗尽 systemd 启动频率计数, 显式操作前先清零。
             if [ "$action" == "start" ] || [ "$action" == "restart" ]; then
                 systemctl reset-failed sing-box >/dev/null 2>&1 || true
             fi
@@ -629,7 +527,8 @@ _manage_service() {
                     fi
                     rm -f "$PID_FILE"
                     [ -s "${SINGBOX_DIR}/relay.json" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
-                    nohup env GOMEMLIMIT="$(_get_mem_limit)MiB" \
+                    local _gogc; _gogc=$(_get_gogc)
+                    nohup env GOMEMLIMIT="$(_get_mem_limit)MiB" ${_gogc:+GOGC=$_gogc} \
                         "$SINGBOX_BIN" run -c "$CONFIG_FILE" -c "${SINGBOX_DIR}/relay.json" \
                         >> "$LOG_FILE" 2>&1 8>&- 9>&- 219>&- &
                     echo $! > "$PID_FILE"
@@ -679,15 +578,22 @@ _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     if command -v apk &>/dev/null; then
-        apk add --no-cache $pkgs >/dev/null 2>&1
+        # 堆上限 <=40MiB 的档才逐包安装压低解包峰值, 大内存机器保持整批安装。
+        if [ "$(_get_mem_limit)" -le 40 ]; then
+            local pkg
+            for pkg in $pkgs; do
+                apk info -e "$pkg" >/dev/null 2>&1 && continue
+                apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+            done
+        else
+            apk add --no-cache $pkgs >/dev/null 2>&1 || return 1
+        fi
     elif command -v apt-get &>/dev/null; then
         # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
         fi
-        # 128M Podman 中一次解析/解包整批依赖会把 apt 推到 cgroup 上限，常见结果是
-        # 第一次 apt-get 被 OOM kill、第二次依靠部分安装状态侥幸成功。容器内改为逐包、
-        # 禁用 recommends 和 dpkg PTY，主动压低峰值内存；普通 LXC/KVM 仍保留批量安装。
+        # 128M Podman 里批量装依赖会被 OOM kill, 容器内逐包安装压低峰值内存。
         if _is_podman_environment; then
             local pkg
             for pkg in $pkgs; do
@@ -782,11 +688,11 @@ _check_combined_config_files() {
     [ -x "$binary" ] || { _error "sing-box 核心不可执行: $binary"; return 1; }
     [ -s "$main_config" ] || { _error "主配置不存在或为空: $main_config"; return 1; }
     [ -s "$relay_config" ] || { _error "中转配置不存在或为空: $relay_config"; return 1; }
-    "$binary" check -c "$main_config" -c "$relay_config"
+    local _check_gogc; _check_gogc=$(_get_gogc)
+    env GOMEMLIMIT="$(_get_mem_limit)MiB" ${_check_gogc:+GOGC=$_check_gogc} "$binary" check -c "$main_config" -c "$relay_config"
 }
 
-# 将菜单中的传统 DNS 地址表示转换为 sing-box 1.12+ typed server。
-# 1.14 已移除 legacy address 字段；域名上游额外使用本地 bootstrap，避免自解析循环。
+# 1.14 已移除 legacy address 字段, 域名上游用本地 bootstrap 避免自解析循环。
 _build_dns_config_json() {
     local address="$1" strategy="$2" type server port path resolver="" server_json
     case "$strategy" in
@@ -844,8 +750,7 @@ _time_is_container() {
     grep -qaE 'container=|lxc|libpod|podman|docker' /proc/1/environ /proc/1/cgroup 2>/dev/null
 }
 
-# 只发起 SNTP 查询；Bash UDP + dd/od，避免为低内存容器安装 Python/守护进程。
-# 随机 transmit nonce 必须被原样回显；检查服务器模式、闰秒状态及 stratum。
+# 只发 SNTP 查询, 用 Bash UDP + dd/od 免为低内存容器装 Python, nonce 须原样回显。
 _time_probe_ntp() {
     local server="$1" port="${2:-123}" nonce escaped="" raw started finished i octet
     local -a bytes
@@ -905,15 +810,13 @@ _time_prepare_ntp_config_locked() {
         && [[ "$previous_status" == reachable || "$previous_status" == unreachable ]]; then
         return 0
     fi
-
-    # 仅迁移无配置、历史默认项或与 sidecar 完全一致的脚本管理项。
-    # 用户自定义服务器、间隔、detour 和显式 enabled:false 不被覆盖。
+    # 只迁移无配置、历史默认或与 sidecar 一致的脚本管理项, 用户自定义不被覆盖。
     if [ "$current" != null ] && [ "$current" != "$managed" ] && ! jq -e '
         .ntp == {enabled:true,server:"time.apple.com",server_port:123,interval:"30m"}
         or .ntp == {enabled:true,server:"time.apple.com",server_port:123,interval:"1m",write_to_system:false,connect_timeout:"3s"}
     ' "$CONFIG_FILE" >/dev/null; then
         if _time_has_ss2022; then
-            _info "保留用户自定义 NTP 配置；SS2022 需确认校时成功，主菜单 [11] 可诊断。"
+            _info "保留用户自定义 NTP 配置；SS2022 需确认校时成功，主菜单 [10] 可诊断。"
             if ! jq -e '.ntp.enabled == true' "$CONFIG_FILE" >/dev/null; then
                 _warn "内置 NTP 已由用户关闭：SS2022 仍依赖系统时间，不能自动补偿宿主机偏差。"
             fi
@@ -951,7 +854,7 @@ _time_prepare_ntp_config_locked() {
         _info "NTP 探测 ${TIME_PROBE_SOURCE} 可达；已配置 sing-box 每 1 分钟补偿协议时钟；系统偏差约 ${TIME_PROBE_OFFSET} 秒，未修改系统时钟。"
     else
         _warn "三个 NTP 时间源均未通过有界探测，暂不启用脚本管理的内置 NTP，避免拖延其他节点启动。"
-        _warn "时间源可达后，请通过主菜单 [11] → [2] 重新探测并修复；SS2022 仍依赖系统时间。"
+        _warn "时间源可达后，请通过主菜单 [10] → [2] 重新探测并修复；SS2022 仍依赖系统时间。"
         _time_has_ss2022 && _warn "检测到 SS2022：系统偏差超过 30 秒时将被拒绝；请使用可达时间源或联系宿主机管理员。"
     fi
     return 0
@@ -1111,6 +1014,10 @@ _remove_node_from_yaml_locked() {
 }
 _find_proxy_name() {
     local port="$1" type="$2" tag="$3" proxy_name=""
+    if [ -n "$tag" ] && [ -f "$ARGO_METADATA_FILE" ]; then
+        proxy_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
+        [ -n "$proxy_name" ] && [ "$proxy_name" != "null" ] && { echo "$proxy_name"; return 0; }
+    fi
     if [ -n "$tag" ] && [ -f "$METADATA_FILE" ]; then
         local yaml_enabled
         yaml_enabled=$(jq -r --arg t "$tag" '.[$t].yaml // empty' "$METADATA_FILE" 2>/dev/null)
@@ -1145,7 +1052,7 @@ _is_shadowtls_inner_tag() {
     jq -e --arg tag "$tag" '.inbounds[]? | select(.type == "shadowtls" and .detour == $tag)' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
-# 仅列出主脚本可管理的外层节点：排除 Argo、HY2 hop 以及 ShadowTLS 内层。
+# 仅列出主脚本可管理的外层节点：排除 HY2 hop 以及 ShadowTLS 内层。
 _list_main_primary_inbounds() {
     [ -s "$CONFIG_FILE" ] || return 0
     local node tag port
@@ -1155,7 +1062,6 @@ _list_main_primary_inbounds() {
         port=$(printf '%s' "$node" | jq -r '.listen_port // empty')
         [ -n "$tag" ] && [ -n "$port" ] || continue
         [[ "$tag" == *"-hop-"* ]] && continue
-        _is_argo_inbound_tag "$tag" && continue
         _is_shadowtls_inner_tag "$tag" && continue
         printf '%s\n' "$node"
     done < <(jq -c '.inbounds[]?' "$CONFIG_FILE" 2>/dev/null)
@@ -1243,38 +1149,14 @@ _rollback_main_node_creation() {
 
 # 内存限额计算
 _get_mem_limit() {
-    local total_mem_mb=0 cgroup_limit="" candidate_mb=0
-    local limit limit_file
+    local total_mem_mb
+    local limit
+    total_mem_mb=$(_memwatch_total_mb)
 
-    total_mem_mb=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
-    [[ "$total_mem_mb" =~ ^[0-9]+$ ]] || total_mem_mb=0
-
-    # cgroup v2 的 memory.high 也可能比 memory.max 更早触发回收；取系统
-    # 可见内存、memory.max 和 memory.high 中最小的有效值，兼容嵌套容器。
-    if [ -r /sys/fs/cgroup/memory.max ]; then
-        for limit_file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.high; do
-            [ -r "$limit_file" ] || continue
-            cgroup_limit=$(cat "$limit_file" 2>/dev/null)
-            if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
-                candidate_mb=$((cgroup_limit / 1024 / 1024))
-                if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
-                    total_mem_mb=$candidate_mb
-                fi
-            fi
-        done
-    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-        cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
-        if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
-            candidate_mb=$((cgroup_limit / 1024 / 1024))
-            if [ "$candidate_mb" -gt 0 ] && { [ "$total_mem_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mem_mb" ]; }; then
-                total_mem_mb=$candidate_mb
-            fi
-        fi
-    fi
-
-    [ "$total_mem_mb" -gt 0 ] || total_mem_mb=128
-
-    if [ "$total_mem_mb" -le 128 ]; then
+    if [ "$total_mem_mb" -le 64 ]; then
+        # 64MB 机器取 3/8 约 24MiB, 留足探针与内核开销, 不越 memwatch 90% 线。
+        limit=$((total_mem_mb * 3 / 8))
+    elif [ "$total_mem_mb" -le 128 ]; then
         # 128MB 机器保留更多空间给内核、TLS、socket 缓冲和测速客户端。
         limit=$((total_mem_mb * 5 / 16))
     elif [ "$total_mem_mb" -le 256 ]; then
@@ -1285,12 +1167,22 @@ _get_mem_limit() {
         limit=$((total_mem_mb * 80 / 100))
     fi
 
-    [ "$limit" -lt 32 ] && limit=32
+    if [ "$total_mem_mb" -le 64 ]; then
+        [ "$limit" -lt 16 ] && limit=16
+    else
+        [ "$limit" -lt 32 ] && limit=32
+    fi
     echo "$limit"
 }
 
-# 页缓存由内核按内存压力自动回收。容器中 /proc/sys/vm/drop_caches 可能
-# 意外映射到宿主机全局开关，主动写入会影响整台宿主机，甚至触发容器重启。
+# 64M 与 128M 档 GOGC 用默认, 只有堆上限 <=16MiB 的更小机器才用 GOGC=50 保命。
+_get_gogc() {
+    local lim
+    lim=$(_get_mem_limit)
+    if [ "$lim" -le 16 ]; then echo "50"; else echo ""; fi
+}
+
+# 容器里写 /proc/sys/vm/drop_caches 可能映射到宿主机全局开关, 绝不主动写。
 _release_install_cache() {
     sync 2>/dev/null || true
     return 0
@@ -1322,9 +1214,9 @@ _install_yq() {
         tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
         checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
         order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
-        if ! wget -qO "$tmp_yq" "${release_base}/${asset}" \
-            || ! wget -qO "$checksums_tmp" "${release_base}/checksums" \
-            || ! wget -qO "$order_tmp" "${release_base}/checksums_hashes_order"; then
+        if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp_yq" "${release_base}/${asset}" \
+            || ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "$checksums_tmp" "${release_base}/checksums" \
+            || ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "$order_tmp" "${release_base}/checksums_hashes_order"; then
             rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
             _error "yq 或官方校验文件下载失败。"
             return 1
@@ -1362,7 +1254,13 @@ _install_yq() {
 # --- 核心变量定义 ---
 export SINGBOX_DIR="/usr/local/etc/sing-box"
 export SINGBOX_BIN="/usr/local/bin/sing-box"
-export SINGBOX_FIXED_VERSION
+export SINGBOX_LEAN_REPO="2777nn/sing-box-extended"
+export SINGBOX_LEAN_RELEASE_TAG="release"
+export SINGBOX_LEAN_API_BASE="https://api.github.com/repos/2777nn/sing-box-extended"
+# 核心版本号统一格式: shtorm 旧版与 MiChongs 新版都认, 资产名 / 锁文件 / 用户输入共用。
+# 二进制内部版本须与资产名一致, 否则 _install_sing_box 拒绝安装。
+export SINGBOX_VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-extended-[0-9.]+|-alpha\.[0-9]+-xiaobaf14g\.[0-9]+)$'
+# 锁定文件内容即锁定的已装版本号 (如 1.14.3-extended-2.7.3), 不再硬编码固定版。
 export SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 export YQ_BINARY="/usr/local/bin/yq"
 export CONFIG_FILE="${SINGBOX_DIR}/config.json"
@@ -1370,14 +1268,23 @@ export RELAY_CONFIG_FILE="${SINGBOX_DIR}/relay.json"
 export CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
 export METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 export ARGO_METADATA_FILE="${SINGBOX_DIR}/argo_metadata.json"
+export WARP_STATE_FILE="${SINGBOX_DIR}/warp.json"
+export WARP_ACCOUNT_FILE="${SINGBOX_DIR}/wgcf-account.toml"
+export WARP_PROFILE_FILE="${SINGBOX_DIR}/wgcf-profile.conf"
+export WGCF_BIN="/usr/local/bin/wgcf"
+export WGCF_VERSION="2.3.1"
+export WARP_PUBLIC_KEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+export WARP_ENDPOINT_HOST="engage.cloudflareclient.com"
+export WARP_ENDPOINT_IP_FALLBACK="162.159.192.1"
+export WARP_RULE_SET_TAG="geosite-google-gemini"
+export WARP_RULE_SET_URL="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google-gemini.srs"
+export WARP_RULE_SET_FILE="${SINGBOX_DIR}/geosite-google-gemini.srs"
+export WARP_CUSTOM_TAG="warp-custom"
 export LOG_FILE="/var/log/sing-box.log"
-export ARGO_LOG_FILE="/var/log/singbox_argo.log"
 export RUNTIME_DIR="/run/singboxlite"
 export PID_FILE="${RUNTIME_DIR}/sing-box.pid"
-export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 export XRAY_RUNTIME_DIR="${RUNTIME_DIR}"
 export XRAY_PID_FILE="${XRAY_RUNTIME_DIR}/xray.pid"
-XRAY_LEGACY_PID_FILE="/run/xray/xray.pid"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
 export DEP_STATE_VERSION="20260831-lowmem-1"
 _detect_init_system
@@ -1387,9 +1294,6 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
-
-export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
 server_ip=""
 BATCH_MODE=false
@@ -1403,12 +1307,12 @@ _install_dependencies() {
     local force="${1:-false}"
     if [ "$force" != "true" ] && [ -s "$DEP_STATE_FILE" ] && grep -qx "$DEP_STATE_VERSION" "$DEP_STATE_FILE" 2>/dev/null; then
         local missing_cached=""
-        for cmd in bash jq curl wget openssl tar unzip flock; do
+        for cmd in bash jq curl openssl tar unzip flock; do
             if ! command -v "$cmd" &>/dev/null; then
                 missing_cached="$missing_cached $cmd"
             fi
         done
-        if ! command -v nft &>/dev/null; then
+        if ! _is_podman_environment && ! command -v nft &>/dev/null; then
             missing_cached="$missing_cached nftables"
         fi
         if [ -z "$missing_cached" ] && [ -x "$YQ_BINARY" ]; then
@@ -1421,15 +1325,16 @@ _install_dependencies() {
     # 核心依赖：脚本运行的绝对前提，必须全部装上
     local lock_pkg="util-linux"
     command -v apk &>/dev/null && lock_pkg="util-linux-misc"
-    local core_pkgs="bash curl jq openssl wget tar unzip ca-certificates ${lock_pkg}"
+    local core_pkgs="bash curl jq openssl tar unzip ca-certificates ${lock_pkg}"
     # 可选依赖：部分功能需要，即使装失败也不致命
     local optional_pkgs="procps nftables socat iproute2 cron lsof"
 
-    # 容器类型不能代替权限探测；Podman 仍尝试提供 nft 命令，实际写入能力由子菜单探测。
+    # Podman 里装 nftables 也写不了主机 netfilter, 容器中跳过整组可选包。
     if _is_podman_environment; then
-        optional_pkgs="nftables"
+        optional_pkgs=""
+        _info "检测到 Podman 容器：跳过 nftables 等可选依赖，使用 sing-box 用户态转发"
     fi
-    
+
     # 针对不同发行版的 cron 包名适配
     if command -v apk &>/dev/null; then
         optional_pkgs="${optional_pkgs/cron/dcron}"
@@ -1443,7 +1348,7 @@ _install_dependencies() {
         # Alpine 版本间拆包名称有差异；其余发行版均由 util-linux 提供。
         _pkg_install util-linux 2>/dev/null || true
     fi
-    
+
     if [ -n "$optional_pkgs" ]; then
         _info "正在安装可选依赖..."
         _pkg_install $optional_pkgs 2>/dev/null || {
@@ -1454,7 +1359,7 @@ _install_dependencies() {
             done
         }
     fi
-    
+
     _install_yq
 
     # Alpine 上优先启用 OpenRC 服务；无 OpenRC PID 1 的容器回退直接启动 crond。
@@ -1473,7 +1378,7 @@ _install_dependencies() {
 
     # 关键依赖验证：如果核心工具缺失则无法继续
     local missing=""
-    for cmd in bash jq curl wget openssl tar unzip flock; do
+    for cmd in bash jq curl openssl tar unzip flock; do
         if ! command -v "$cmd" &>/dev/null; then
             missing="$missing $cmd"
         fi
@@ -1491,68 +1396,18 @@ _install_dependencies() {
     printf '%s\n' "$DEP_STATE_VERSION" > "$DEP_STATE_FILE"
 }
 
-# 未装 sing-box 时主菜单只准备通用工具；nftables 是否能写规则由端口转发菜单实测。
-_install_menu_dependencies() {
-    local lock_pkg="util-linux" cron_pkg="cron" missing="" cmd
-    if command -v apk >/dev/null 2>&1; then
-        lock_pkg="util-linux-misc"
-        cron_pkg="dcron"
-    elif ! command -v apt-get >/dev/null 2>&1; then
-        cron_pkg="cronie"
-    fi
-    for cmd in bash jq curl wget openssl tar unzip flock timeout; do
-        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
-    done
-    if [ -n "$missing" ]; then
-        _info "正在补齐菜单依赖:${missing}"
-        _pkg_install bash jq curl wget openssl tar unzip ca-certificates "$lock_pkg" || return 1
-    fi
-    for cmd in bash jq curl wget openssl tar unzip flock timeout; do
-        command -v "$cmd" >/dev/null 2>&1 || { _error "缺少菜单依赖: $cmd"; return 1; }
-    done
-    command -v nft >/dev/null 2>&1 || _pkg_install nftables >/dev/null 2>&1 || true
-    command -v ss >/dev/null 2>&1 || _pkg_install iproute2 >/dev/null 2>&1 || true
-    command -v crontab >/dev/null 2>&1 || _pkg_install "$cron_pkg" >/dev/null 2>&1 || true
-    if command -v apk >/dev/null 2>&1 && command -v crond >/dev/null 2>&1; then
-        if command -v rc-service >/dev/null 2>&1; then
-            rc-service dcron start >/dev/null 2>&1 || true
-            rc-update add dcron default >/dev/null 2>&1 || true
-        else
-            pgrep -x crond >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
-        fi
-    fi
-}
-
-# 确保 nftables 可用，并检测实际 netfilter 写入能力
-_ensure_nftables() {
-    if ! command -v nft &>/dev/null; then
-        _info "未检测到 nftables，尝试安装..."
-        _pkg_install nftables
-        if ! command -v nft &>/dev/null; then
-            _error "nftables 安装失败。"
-            return 1
-        fi
-        _success "nftables 安装成功。"
-    fi
-
-    if ! _nft_can_redirect 65530 65531; then
-        _warn "nftables 命令存在，但当前环境无 netfilter 写权限（容器/LXC 无特权模式）。"
-        _warn "端口转发将自动使用 sing-box 引擎代替。"
-        return 2
-    fi
-
-    return 0
-}
-
 _singbox_core_is_locked() {
     [ -s "$SINGBOX_CORE_LOCK_FILE" ]
 }
 
 _write_singbox_core_lock() {
+    # 锁定当前已装版本: $1 为版本号 (如 1.14.3-extended-2.7.3 / 1.15.0-alpha.13-xiaobaf14g.11)。
+    local version="${1:-}"
+    [[ "$version" =~ $SINGBOX_VERSION_RE ]] || return 1
     local tmp
     mkdir -p "$SINGBOX_DIR" || return 1
     tmp=$(mktemp "${SINGBOX_CORE_LOCK_FILE}.tmp.XXXXXX") || return 1
-    if ! printf '%s\n' "$SINGBOX_FIXED_VERSION" > "$tmp" \
+    if ! printf '%s\n' "$version" > "$tmp" \
         || ! chmod 600 "$tmp" \
         || ! mv -f "$tmp" "$SINGBOX_CORE_LOCK_FILE"; then
         rm -f -- "$tmp"
@@ -1560,85 +1415,81 @@ _write_singbox_core_lock() {
     fi
 }
 
+_read_singbox_core_lock() {
+    local version=""
+    [ -s "$SINGBOX_CORE_LOCK_FILE" ] || return 1
+    version=$(head -n 1 "$SINGBOX_CORE_LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
+    [[ "$version" =~ $SINGBOX_VERSION_RE ]] || return 1
+    printf '%s\n' "$version"
+}
+
+_unlock_singbox_core() {
+    rm -f -- "$SINGBOX_CORE_LOCK_FILE"
+}
+
+# 精简版 sing-box-extended, 按本机架构 (amd64/arm64) 选资产。
+_lean_list_versions() {
+    # 输出 TSV: 版本 \t 资产名 \t 下载链接 \t API摘要 \t tag \t 发布时间
+    curl -fsSL --retry 3 --connect-timeout 10 "${SINGBOX_LEAN_API_BASE}/releases?per_page=30" 2>/dev/null | jq -r '
+        [ .[] | select(.draft == false and .prerelease == false)
+          | {tag: (.tag_name // ""), published: (.published_at // ""),
+             asset: (.assets[]? | select(.name | test("^sing-box-[0-9]+\\.[0-9]+\\.[0-9]+(-extended-[0-9.]+|-alpha\\.[0-9]+-xiaobaf14g\\.[0-9]+)-lean-(amd64|arm64)$")))}
+          | {version: (.asset.name | sub("^sing-box-"; "") | sub("-lean-(amd64|arm64)$"; "")),
+             name: .asset.name, url: (.asset.browser_download_url // ""),
+             digest: (.asset.digest // ""), tag: .tag, published: .published}
+        ] | sort_by(.published) | reverse
+          | .[] | [.version, .name, .url, .digest, .tag, .published] | @tsv
+    ' 2>/dev/null
+}
+
 _install_sing_box() {
     local requested_version="${1:-latest}"
-    local api_url requested_label
-    case "$requested_version" in
-        latest)
-            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-            requested_label="最新稳定版"
-            ;;
-        "$SINGBOX_FIXED_VERSION")
-            api_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SINGBOX_FIXED_VERSION}"
-            requested_label="固定版 v${SINGBOX_FIXED_VERSION}"
-            ;;
-        *)
-            _error "不允许安装未授权的 sing-box 版本: ${requested_version}"
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) _error "精简版不支持架构: $arch (仅 amd64 / arm64)"; return 1 ;;
+    esac
+
+    local versions_tsv asset_line release_version asset_name download_url asset_digest release_tag
+    versions_tsv=$(_lean_list_versions) || versions_tsv=""
+    if [ -z "$versions_tsv" ]; then
+        _error "无法读取 ${SINGBOX_LEAN_REPO} 的发布信息 (releases API 为空或网络失败)。"
+        return 1
+    fi
+    versions_tsv=$(printf '%s\n' "$versions_tsv" | awk -F'\t' -v suffix="-lean-${arch}" 'length($2) >= length(suffix) && substr($2, length($2) - length(suffix) + 1) == suffix')
+    if [ -z "$versions_tsv" ]; then
+        _error "仓库里没有 ${arch} 架构的精简版资产。"
+        return 1
+    fi
+    if [ "$requested_version" = "latest" ]; then
+        asset_line=$(printf '%s\n' "$versions_tsv" | awk -F'\t' '!seen[$1]++' | head -n 1)
+    else
+        [[ "$requested_version" =~ $SINGBOX_VERSION_RE ]] \
+            || { _error "版本号格式无效: ${requested_version} (应为如 1.14.3-extended-2.7.3 或 1.15.0-alpha.13-xiaobaf14g.11)"; return 1; }
+        asset_line=$(printf '%s\n' "$versions_tsv" | awk -F'\t' -v v="$requested_version" '$1 == v && !seen[$1]++' | head -n 1)
+        if [ -z "$asset_line" ]; then
+            _error "历史版本里没有 v${requested_version}。"
+            _error "请先确认已在 https://github.com/${SINGBOX_LEAN_REPO}/releases 发布该版本资产 (资产名 sing-box-${requested_version}-lean-${arch})。"
             return 1
-            ;;
-    esac
-    _info "正在安装 ${requested_label} sing-box..."
-    local arch=$(uname -m)
-    local arch_tag
-    case $arch in
-        x86_64|amd64) arch_tag='amd64' ;;
-        aarch64|arm64) arch_tag='arm64' ;;
-        armv7l) arch_tag='armv7' ;;
-        *) _error "不支持的架构：$arch"; return 1 ;;
-    esac
-    
-    # 检测 C 库类型：Alpine 等系统使用 musl，需要下载对应版本
-    local libc_suffix=""
-    if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
-        _info "检测到 musl libc (Alpine 等系统)，将下载 musl 版本..."
-        libc_suffix="-musl"
+        fi
     fi
-    
-    local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local asset_info release_tag release_draft release_prerelease
-    local asset_count asset_name download_url asset_digest release_version expected_asset_name
-    if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 "$api_url" | jq -r --arg pattern "$search_pattern" '
-        [.assets[] | select(.name | endswith($pattern))] as $matches
-        | [(.tag_name // ""),
-           (if (.draft | type) == "boolean" then .draft else true end),
-           (if (.prerelease | type) == "boolean" then .prerelease else true end),
-           ($matches | length), ($matches[0].name // ""),
-           ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
-        | @tsv
-    '); then
-        _error "无法读取 sing-box 官方发布信息。"
-        return 1
-    fi
-    IFS=$'\t' read -r release_tag release_draft release_prerelease asset_count asset_name download_url asset_digest <<< "$asset_info"
-    if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-        || [ "$release_draft" != "false" ] || [ "$release_prerelease" != "false" ]; then
-        _error "sing-box 官方发布元数据无效或不是稳定版，已拒绝安装。"
-        return 1
-    fi
-    release_version="${release_tag#v}"
-    if [ "$requested_version" != "latest" ] && [ "$release_version" != "$requested_version" ]; then
-        _error "固定版响应不匹配：请求 v${requested_version}，实际为 ${release_tag}。"
-        return 1
-    fi
-    if [ "$asset_count" != "1" ]; then
-        _error "sing-box 官方发布中目标资产数量异常 (${asset_count:-无法解析})，已拒绝安装。"
-        return 1
-    fi
-    expected_asset_name="sing-box-${release_version}-linux-${arch_tag}${libc_suffix}.tar.gz"
-    if [ "$asset_name" != "$expected_asset_name" ] || [ -z "$download_url" ] \
-        || [[ "$download_url" != "https://github.com/SagerNet/sing-box/releases/download/${release_tag}/${expected_asset_name}" ]]; then
-        _error "无法获取可信的 sing-box 下载链接 (搜索: ${search_pattern})。"
+    IFS=$'\t' read -r release_version asset_name download_url asset_digest release_tag _published <<< "$asset_line"
+    [ -n "$release_version" ] && [ -n "$asset_name" ] && [ -n "$download_url" ] || {
+        _error "精简版发布元数据解析失败。"; return 1; }
+    if [[ "$download_url" != "https://github.com/${SINGBOX_LEAN_REPO}/releases/download/${release_tag}/${asset_name}" ]]; then
+        _error "精简版下载链接不在可信前缀内, 已拒绝安装: ${download_url}"
         return 1
     fi
     if [[ ! "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        _error "sing-box 官方资产缺少有效的 API SHA-256 摘要，已拒绝替换核心。"
+        _error "精简版资产缺少有效的 API SHA-256 摘要, 已拒绝安装。"
         return 1
     fi
+    _info "正在安装精简版 sing-box v${release_version} (来自 ${SINGBOX_LEAN_REPO} tag ${release_tag})..."
 
-    local temp_dir extracted_bin expected actual staged_bin digest_file extracted_version
+    local temp_dir staged_bin expected actual
     mkdir -p /var/tmp || { _error "创建安装临时目录失败。"; return 1; }
-    # 上一次安装若被 OOM/SIGKILL 终止，退出清理不会执行。只清理本脚本
-    # 使用的精确目录，避免残留的 90MB 二进制继续挤占容器内存配额。
     local stale_dir stale_pid
     for stale_dir in /var/tmp/.singbox-install.*; do
         [ -d "$stale_dir" ] || continue
@@ -1651,57 +1502,52 @@ _install_sing_box() {
     done
     temp_dir=$(mktemp -d /var/tmp/.singbox-install.XXXXXX) || { _error "创建临时目录失败。"; return 1; }
     printf '%s\n' "$$" > "${temp_dir}/.active"
-    digest_file="${temp_dir}/.archive.sha256"
 
-    _info "正在下载并校验 sing-box 安装包..."
-    if command -v sha256sum &>/dev/null; then
-        wget -qO- "$download_url" | tee >(sha256sum > "$digest_file") | tar -xzf - -C "$temp_dir"
-    else
-        wget -qO- "$download_url" | tee >(openssl dgst -sha256 > "$digest_file") | tar -xzf - -C "$temp_dir"
-    fi
-    local -a stream_status=("${PIPESTATUS[@]}")
-    if [ "${stream_status[0]:-1}" -ne 0 ] || [ "${stream_status[2]:-1}" -ne 0 ]; then
-        _error "sing-box 安装包下载失败。"
+    _info "正在下载并校验精简版核心..."
+    sync
+    local bin_file="${temp_dir}/sing-box-lean" _dl_try _dl_ok=0
+    for _dl_try in 1 2 3; do
+        if curl -fsSL --connect-timeout 10 --max-time 120 -o "$bin_file" "$download_url"; then _dl_ok=1; break; fi
+        sleep 2
+    done
+    if [ "$_dl_ok" != "1" ]; then
+        _error "精简版核心下载失败 (3 次重试后)。"
         rm -rf "$temp_dir"
         return 1
     fi
-    local digest_wait=0
-    while [ ! -s "$digest_file" ] && [ "$digest_wait" -lt 50 ]; do
-        sleep 0.1
-        digest_wait=$((digest_wait + 1))
-    done
+    sync
     expected="${asset_digest#sha256:}"
     if command -v sha256sum &>/dev/null; then
-        actual=$(awk '{print $1}' "$digest_file" 2>/dev/null)
+        actual=$(sha256sum "$bin_file" | awk '{print $1}')
     else
-        actual=$(awk '{print $NF}' "$digest_file" 2>/dev/null)
+        actual=$(openssl dgst -sha256 "$bin_file" 2>/dev/null | awk '{print $NF}')
     fi
     if [ -z "$expected" ] || [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-        _error "sing-box 安装包 SHA-256 校验失败，已拒绝替换核心。"
+        _error "精简版核心 SHA-256 校验失败, 已拒绝替换核心。"
         rm -rf "$temp_dir"
         return 1
     fi
-
-    extracted_bin=$(find "$temp_dir" -name sing-box -type f 2>/dev/null | head -n 1)
-    if [ -z "$extracted_bin" ]; then
-        _error "解压后未找到 sing-box 二进制文件。"
+    chmod 755 "$bin_file" || { rm -rf "$temp_dir"; return 1; }
+    local _sb_version_out _sb_version_status _sb_gogc extracted_version
+    _sb_gogc=$(_get_gogc)
+    _sb_version_out=$(env GOMEMLIMIT="$(_get_mem_limit)MiB" ${_sb_gogc:+GOGC=$_sb_gogc} "$bin_file" version 2>&1)
+    _sb_version_status=$?
+    if [ "$_sb_version_status" -ne 0 ]; then
+        if [ "$_sb_version_status" -eq 137 ]; then
+            _error "精简版核心在 version 检查时被 OOM 杀掉 (exit 137), 不是二进制损坏: 请先停掉其他服务、sync 后重试。"
+        else
+            _error "下载的精简版核心无法执行, 已拒绝安装。"
+        fi
         rm -rf "$temp_dir"
         return 1
     fi
-    chmod 755 "$extracted_bin" || { rm -rf "$temp_dir"; return 1; }
-    if ! "$extracted_bin" version >/dev/null 2>&1; then
-        _error "下载的 sing-box 核心无法执行，已拒绝安装。"
-        rm -rf "$temp_dir"
-        return 1
-    fi
-    extracted_version=$("$extracted_bin" version 2>/dev/null | sed -n 's/^sing-box version \([^[:space:]]*\).*/\1/p' | head -n 1)
+    extracted_version=$(printf '%s\n' "$_sb_version_out" | sed -n 's/^sing-box version \([^[:space:]]*\).*/\1/p' | head -n 1)
     if [ "$extracted_version" != "$release_version" ]; then
-        _error "下载核心版本与官方发布不匹配：期望 v${release_version}，实际 v${extracted_version:-未知}。"
+        _error "下载核心版本与发布不匹配: 期望 v${release_version}, 实际 v${extracted_version:-未知}。"
         rm -rf "$temp_dir"
         return 1
     fi
 
-    # 在触碰旧核心之前，用新核心校验真实的双配置组合。
     if [ -s "$CONFIG_FILE" ]; then
         local validation_relay="$RELAY_CONFIG_FILE"
         if [ ! -s "$validation_relay" ]; then
@@ -1709,8 +1555,8 @@ _install_sing_box() {
             printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$validation_relay"
         fi
         local validation_result
-        if ! validation_result=$(_check_combined_config_files "$extracted_bin" "$CONFIG_FILE" "$validation_relay" 2>&1); then
-            _error "新核心无法加载当前 config.json + relay.json，已取消更新："
+        if ! validation_result=$(_check_combined_config_files "$bin_file" "$CONFIG_FILE" "$validation_relay" 2>&1); then
+            _error "新核心无法加载当前 config.json + relay.json, 已取消更新:"
             echo "$validation_result"
             rm -rf "$temp_dir"
             return 1
@@ -1720,10 +1566,8 @@ _install_sing_box() {
     mkdir -p "$(dirname "$SINGBOX_BIN")" || { rm -rf "$temp_dir"; return 1; }
     staged_bin=$(mktemp "$(dirname "$SINGBOX_BIN")/.sing-box.new.XXXXXX") || { rm -rf "$temp_dir"; return 1; }
     rm -f -- "$staged_bin"
-    if ! mv -f -- "$extracted_bin" "$staged_bin"; then
-        # /var/tmp 与安装目录通常位于同一文件系统；跨文件系统时再退回
-        # cp，保证原子替换流程仍可用。
-        if ! cp -- "$extracted_bin" "$staged_bin"; then
+    if ! mv -f -- "$bin_file" "$staged_bin"; then
+        if ! cp -- "$bin_file" "$staged_bin"; then
             rm -f -- "$staged_bin"; rm -rf -- "$temp_dir"; return 1
         fi
     fi
@@ -1747,7 +1591,7 @@ _install_sing_box() {
     rm -rf "$temp_dir"
     _release_install_cache
     SINGBOX_STAGED_VERSION="$release_version"
-    _success "sing-box v${release_version} 已安全暂存: ${SINGBOX_BIN}"
+    _success "精简版 sing-box v${release_version} 已安全暂存: ${SINGBOX_BIN}"
 }
 
 _rollback_singbox_binary() {
@@ -1764,1063 +1608,199 @@ _commit_singbox_binary() {
     SINGBOX_UPDATE_BACKUP=""
 }
 
-_install_cloudflared() {
-    if [ -x "${CLOUDFLARED_BIN}" ] && "${CLOUDFLARED_BIN}" --version >/dev/null 2>&1; then
-        _info "cloudflared 已安装: $(${CLOUDFLARED_BIN} --version 2>&1 | head -n1)"
-        return 0
-    fi
-    
-    _info "正在安装依据环境所需的组件 (ca-certificates)..."
-    _pkg_install ca-certificates # 关键修复：Alpine 等精简系统必须有证书才能进行 TLS 握手
-    
-    _info "正在安装 cloudflared..."
-    local arch=$(uname -m)
-    local arch_tag
-    case $arch in
-        x86_64|amd64) arch_tag='amd64' ;;
-        aarch64|arm64) arch_tag='arm64' ;;
-        armv7l) arch_tag='arm' ;;
-        *) _error "不支持的架构：$arch"; return 1 ;;
+_argo_cf_tag() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    printf 'argo-cf-%s\n' "$port"
+}
+
+_singbox_is_running() {
+    case "${INIT_SYSTEM:-}" in
+        systemd) systemctl is-active --quiet sing-box 2>/dev/null ;;
+        openrc) rc-service sing-box status 2>/dev/null | grep -q "started" ;;
+        *) _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN" ;;
     esac
-    
-    local asset_name="cloudflared-linux-${arch_tag}"
-    local asset_count asset_info download_url asset_digest expected actual
-    if ! asset_info=$(curl -fsSL --retry 3 --connect-timeout 10 https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r --arg name "$asset_name" '
-        [.assets[] | select(.name == $name)] as $matches
-        | [($matches | length), ($matches[0].browser_download_url // ""), ($matches[0].digest // "")]
-        | @tsv
-    '); then
-        _error "无法读取 cloudflared 官方发布信息。"
-        return 1
-    fi
-    IFS=$'\t' read -r asset_count download_url asset_digest <<< "$asset_info"
-    if [ "$asset_count" != "1" ]; then
-        _error "cloudflared 官方发布中目标资产数量异常 (${asset_count:-无法解析})。"
-        return 1
-    fi
-    if [[ "$download_url" != https://github.com/cloudflare/cloudflared/releases/download/* ]] \
-        || [[ ! "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        _error "cloudflared 官方资产缺少可信下载地址或 API SHA-256 摘要，已拒绝安装。"
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$CLOUDFLARED_BIN")" || return 1
-    local tmp_cloudflared
-    tmp_cloudflared=$(mktemp "$(dirname "$CLOUDFLARED_BIN")/.cloudflared.new.XXXXXX") || return 1
-    if ! wget -qO "$tmp_cloudflared" "$download_url"; then
-        rm -f "$tmp_cloudflared"
-        _error "cloudflared 下载失败!"
-        return 1
-    fi
-    expected="${asset_digest#sha256:}"
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$tmp_cloudflared" | awk '{print $1}')
-    else
-        actual=$(openssl dgst -sha256 "$tmp_cloudflared" 2>/dev/null | awk '{print $NF}')
-    fi
-    if [ -z "$actual" ] || [ "${actual,,}" != "$expected" ]; then
-        rm -f -- "$tmp_cloudflared"
-        _error "cloudflared SHA-256 校验失败，已拒绝安装。"
-        return 1
-    fi
-    chmod 755 "$tmp_cloudflared" || { rm -f "$tmp_cloudflared"; return 1; }
-    if ! "$tmp_cloudflared" --version >/dev/null 2>&1; then
-        rm -f "$tmp_cloudflared"
-        _error "下载的 cloudflared 无法执行，已拒绝安装。"
-        return 1
-    fi
-    mv -f "$tmp_cloudflared" "$CLOUDFLARED_BIN" || { rm -f "$tmp_cloudflared"; return 1; }
-    
-    _success "cloudflared 安装成功: $(${CLOUDFLARED_BIN} --version 2>&1 | head -n1)"
 }
 
-# --- Argo Tunnel 功能 ---
-
-_prepare_argo_runtime_dir() {
-    if [ -L "$RUNTIME_DIR" ]; then
-        _error "Argo 运行目录不能是符号链接: $RUNTIME_DIR"
-        return 1
-    fi
-    mkdir -p "$RUNTIME_DIR" || return 1
-    chmod 700 "$RUNTIME_DIR" 2>/dev/null || return 1
+_argo_token_is_valid() {
+    local token="$1" decoded=""
+    [[ "$token" =~ ^eyJ[A-Za-z0-9_-]+={0,2}$ ]] || return 1
+    decoded=$(printf '%s' "$token" | base64 -d 2>/dev/null || true)
+    [ -n "$decoded" ] || return 1
+    printf '%s' "$decoded" | jq -e '.t // .id // empty' >/dev/null 2>&1 || true
+    return 0
 }
 
-_argo_pid_file() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
-    printf '%s/argo-%s.pid\n' "$RUNTIME_DIR" "$port"
+_argo_extract_token() {
+    local input="$1" token=""
+    token=$(printf '%s' "$input" | grep -oE 'eyJ[A-Za-z0-9_-]+={0,2}' | head -n 1)
+    [ -n "$token" ] && { printf '%s\n' "$token"; return 0; }
+    printf '%s' "$input" | tr -d '[:space:]'
 }
 
-_argo_log_file() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
-    printf '/var/log/singbox_argo_%s.log\n' "$port"
+
+_add_cloudflared_inbound() {
+    local port="$1" token="$2" cf_tag cf_json
+    cf_tag=$(_argo_cf_tag "$port") || return 1
+    _argo_token_is_valid "$token" || { _error "Argo token 格式无效: 应为 Zero Trust 后台的 Base64 token (eyJ 开头)。"; return 1; }
+    cf_json=$(jq -n --arg t "$cf_tag" --arg token "$token" \
+        '{type:"cloudflared",tag:$t,token:$token,protocol:"auto",ha_connections:4}') || return 1
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$cf]' --argjson cf "$cf_json" || return 1
 }
 
-_migrate_legacy_argo_state() {
-    local port="$1" pid_file legacy_pid_file legacy_log_file legacy_pid=""
-    pid_file=$(_argo_pid_file "$port") || return 1
-    _prepare_argo_runtime_dir || return 1
-    legacy_pid_file="/tmp/singbox_argo_${port}.pid"
-    legacy_log_file="/tmp/singbox_argo_${port}.log"
 
-    if _is_pid_file_running_cmd "$pid_file" "$CLOUDFLARED_BIN"; then
-        rm -f -- "$legacy_pid_file" "$legacy_log_file"
-        return 0
-    fi
-    rm -f -- "$pid_file"
-
-    # /tmp 旧 PID 只有在不是符号链接且 cmdline 确认为 cloudflared 时才迁移。
-    if [ -s "$legacy_pid_file" ] && [ ! -L "$legacy_pid_file" ]; then
-        legacy_pid=$(cat "$legacy_pid_file" 2>/dev/null)
-        if _is_pid_running_cmd "$legacy_pid" "$CLOUDFLARED_BIN"; then
-            printf '%s\n' "$legacy_pid" > "$pid_file" || return 1
-            chmod 600 "$pid_file" 2>/dev/null || { rm -f -- "$pid_file"; return 1; }
-        fi
-    fi
-    rm -f -- "$legacy_pid_file" "$legacy_log_file"
-}
-
-_argo_domain_resolves() {
-    local domain="$1" remote_ip="" dns_json=""
-    [[ "$domain" =~ ^[A-Za-z0-9-]+\.trycloudflare\.com$ ]] || return 1
-
-    if command -v getent >/dev/null 2>&1; then
-        getent ahostsv4 "$domain" >/dev/null 2>&1 && return 0
-        getent hosts "$domain" >/dev/null 2>&1 && return 0
-    fi
-    if command -v nslookup >/dev/null 2>&1; then
-        nslookup "$domain" >/dev/null 2>&1 && return 0
-    fi
-
-    # 系统递归解析器可能缓存刚创建域名的 NXDOMAIN。Quick Tunnel 属于
-    # Cloudflare 服务，额外用其 DoH 端点核验公开记录，避免本机负缓存误判。
-    if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-        dns_json=$(curl -fsS --connect-timeout 5 --max-time 10 \
-            -H 'accept: application/dns-json' --get \
-            --data-urlencode "name=${domain}" --data-urlencode 'type=A' \
-            'https://1.1.1.1/dns-query' 2>/dev/null || true)
-        printf '%s' "$dns_json" | jq -e '
-            (.Status == 0) and any(.Answer[]?; (.type == 1 or .type == 28) and ((.data // "") | length > 0))
-        ' >/dev/null 2>&1 && return 0
-    fi
-
-    # 精简容器可能同时缺少 getent/nslookup。curl 即使收到后端协议错误，
-    # 只要已经解析并连接到边缘节点，也会填充 remote_ip。
-    remote_ip=$(curl -ksS --connect-timeout 5 --max-time 8 -o /dev/null \
-        -w '%{remote_ip}' "https://${domain}/" 2>/dev/null || true)
-    [ -n "$remote_ip" ]
-}
-
-_start_argo_tunnel() {
-    local target_port="$1"
-    local protocol="$2"
-    local token="$3" # 可选，用于固定隧道
-    local retry_count="${4:-0}"
-    
-    # 基于端口生成独立的受保护 PID 和日志路径，并迁移旧 /tmp 状态。
-    local pid_file log_file
-    pid_file=$(_argo_pid_file "$target_port") || { _error "无效的 Argo 内部端口: $target_port"; return 1; }
-    log_file=$(_argo_log_file "$target_port") || return 1
-    _migrate_legacy_argo_state "$target_port" || return 1
-    
-    _info "正在启动 Argo 隧道 (端口: $target_port)..." >&2
-    
-    # 检查该端口对应的隧道是否已在运行
-    if [ -f "$pid_file" ]; then
-        local old_pid
-        old_pid=$(cat "$pid_file" 2>/dev/null)
-        if _is_pid_running_cmd "$old_pid" "$CLOUDFLARED_BIN"; then
-            _warning "检测到端口 $target_port 的 Argo 隧道已在运行 (PID: $old_pid)" >&2
-            return 0
-        fi
-    fi
-    
-    # 清理旧日志和同步时间
-    rm -f -- "$pid_file" "$log_file"
-    : > "$log_file" || return 1
-    chmod 600 "$log_file" 2>/dev/null || return 1
-    _sync_system_time
-    
-    if [ -n "$token" ]; then
-        # --- Token 固定隧道模式 ---
-        _info "启动固定隧道 (Token 模式)..." >&2
-        
-        # 强制锁定 protocol http2 (h2)，防止 QUIC (UDP) 被阻断导致连接失败
-        # 增加 --no-autoupdate 防止在精简系统上因自更新导致的意外进程挂起
-        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate run --token "$token" > "${log_file}" 2>&1 &
-            
-        local cf_pid=$!
-        printf '%s\n' "$cf_pid" > "${pid_file}"
-        chmod 600 "$pid_file" 2>/dev/null || true
-        
-        sleep 5
-        if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
-             _error "cloudflared 进程已退出！" >&2
-             _error "Token 可能无效，或者网络连接被拒绝。" >&2
-             echo "--- 错误日志 (最后 20 行) ---" >&2
-             cat "${log_file}" | tail -20 >&2
-             echo "-----------------------------"
-             rm -f -- "$pid_file"
-             return 1
-        fi
-        _success "Argo 固定隧道 (端口: $target_port) 启动成功!" >&2
-        return 0
-    else
-        # --- URL 临时隧道模式 ---
-        _info "启动临时隧道，指向 127.0.0.1:${target_port}..." >&2
-        
-        # 优化：强制指定 http2 协议并禁用自动更新
-        nohup "${CLOUDFLARED_BIN}" tunnel --protocol http2 --no-autoupdate --url "http://127.0.0.1:${target_port}" \
-            --logfile "${log_file}" \
-            > /dev/null 2>&1 &
-        
-        local cf_pid=$!
-        printf '%s\n' "$cf_pid" > "${pid_file}"
-        chmod 600 "$pid_file" 2>/dev/null || true
-        
-        # 等待隧道启动并获取域名
-        _info "等待隧道建立 (最多30秒)..." >&2
-        
-        local tunnel_domain=""
-        local wait_count=0
-        local max_wait=30
-        
-        while [ $wait_count -lt $max_wait ]; do
-            sleep 2
-            wait_count=$((wait_count + 2))
-            
-            # 检查进程是否还在运行
-            if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
-                _error "cloudflared 进程已退出，请检查日志: ${log_file}" >&2
-                cat "${log_file}" 2>/dev/null | tail -20 >&2
-                return 1
-            fi
-            
-            # 优化域名提取正则表达式，确保无论日志格式如何变化都能准确抓取
-            if [ -f "${log_file}" ]; then
-                tunnel_domain=$(grep -oE 'https?://[a-zA-Z0-9-]+\.trycloudflare\.com' "${log_file}" 2>/dev/null | head -n 1 | sed -E 's|https?://||')
-                if [ -n "$tunnel_domain" ]; then
-                    break
-                fi
-            fi
-            echo -n "." >&2
-        done
-        echo "" >&2
-        
-        if [ -n "$tunnel_domain" ]; then
-            _info "域名已获取，正在等待 DNS 发布 (最多90秒)..." >&2
-            local dns_wait=0 dns_ready=false
-            while [ "$dns_wait" -lt 90 ]; do
-                if _argo_domain_resolves "$tunnel_domain"; then
-                    dns_ready=true
-                    break
-                fi
-                if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
-                    break
-                fi
-                sleep 5
-                dns_wait=$((dns_wait + 5))
-            done
-
-            if [ "$dns_ready" != true ]; then
-                _warn "Cloudflare 已分配临时域名，但 DNS 尚未发布，正在清理本次隧道。" >&2
-                _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN" && kill "$cf_pid" 2>/dev/null
-                wait "$cf_pid" 2>/dev/null || true
-                rm -f -- "$pid_file" "$log_file"
-                if [ "$retry_count" -lt 1 ]; then
-                    _warn "正在自动重新申请一次临时域名..." >&2
-                    _start_argo_tunnel "$target_port" "$protocol" "" "$((retry_count + 1))"
-                    return $?
-                fi
-                _error "Cloudflare 临时域名连续两次未完成 DNS 发布，请稍后重试。" >&2
-                return 1
-            fi
-
-            _info "域名已发布，正在进行稳定性测试 (5秒)..." >&2
-            sleep 5
-            if ! _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN"; then
-                 _error "稳定性测试失败：cloudflared 进程异常退出。" >&2
-                 cat "${log_file}" 2>/dev/null | tail -n 10 >&2
-                 return 1
-            fi
-
-            _success "Argo 临时隧道建立成功: ${tunnel_domain}" >&2
-            echo "$tunnel_domain"
-            return 0
-        else
-            _error "获取临时域名超时。请检查网络。日志最后几行：" >&2
-            cat "${log_file}" 2>/dev/null | tail -n 5 >&2
-            _is_pid_running_cmd "$cf_pid" "$CLOUDFLARED_BIN" && kill "$cf_pid" 2>/dev/null
-            rm -f "${pid_file}"
-            return 1
-        fi
-    fi
-}
-
-_stop_argo_tunnel() {
-    local target_port="$1"
-    local pid_file log_file
-    pid_file=$(_argo_pid_file "$target_port") || return 1
-    log_file=$(_argo_log_file "$target_port") || return 1
-    _migrate_legacy_argo_state "$target_port" || return 1
-
-    if [ -f "$pid_file" ]; then
-        local pid
-        pid=$(cat "$pid_file" 2>/dev/null)
-        if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
-            kill "$pid" 2>/dev/null
-            _success "Argo 隧道 (端口: $target_port) 已停止"
-        fi
-    fi
-    rm -f -- "$pid_file" "$log_file" "/tmp/singbox_argo_${target_port}.pid" "/tmp/singbox_argo_${target_port}.log"
-}
-
-_stop_all_argo_tunnels() {
-    _info "正在停止所有 Argo 隧道..."
-    local stopped_any=false
-    local pid_file filename port
-
-    # 优先按元数据停止，可兼容尚未迁移的旧 /tmp PID。
-    if [ -s "$ARGO_METADATA_FILE" ]; then
-        while IFS= read -r port; do
-            [[ "$port" =~ ^[0-9]+$ ]] || continue
-            _stop_argo_tunnel "$port"
-            stopped_any=true
-        done < <(jq -r '.[].local_port // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
-    fi
-
-    for pid_file in "$RUNTIME_DIR"/argo-*.pid; do
-        [ -e "$pid_file" ] || continue
-        filename=$(basename "$pid_file")
-        port=${filename#argo-}
-        port=${port%.pid}
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        _stop_argo_tunnel "$port"
-        stopped_any=true
-    done
-    for pid_file in /tmp/singbox_argo_*.pid; do
-        [ -e "$pid_file" ] || continue
-        filename=$(basename "$pid_file")
-        port=${filename#singbox_argo_}
-        port=${port%.pid}
-        [[ "$port" =~ ^[0-9]+$ ]] || { rm -f -- "$pid_file"; continue; }
-        _stop_argo_tunnel "$port"
-        stopped_any=true
-    done
-    if [ "$stopped_any" = false ]; then
-        _warn "未找到本脚本记录的 Argo PID 文件，未执行全局 cloudflared 清理。"
-    fi
-}
-
-# ============================================================
-# 统一 Argo 节点创建函数 (消除 VLESS/Trojan 重复代码)
-# 参数: $1 = 协议类型 ("vless" 或 "trojan")
-# ============================================================
 _add_argo_node() {
-    local protocol="$1"
-    local protocol_label=""
-    local proto_name=""
-    case "$protocol" in
-        vless) protocol_label="VLESS-WS"; proto_name="Vless" ;;
-        trojan) protocol_label="Trojan-WS"; proto_name="Trojan" ;;
-        *) _error "不支持的 Argo 协议: $protocol"; return 1 ;;
-    esac
+local protocol="$1"
+local protocol_label=""
+local proto_name=""
+case "$protocol" in
+vless-xhttp-enc) protocol_label="VLESS-XHTTP-ENC-Vision"; proto_name="Vless-XHTTP-ENC";;
+vless-ws-enc) protocol_label="VLESS-WS-ENC-Vision"; proto_name="Vless-WS-ENC";;
+*) _error "不支持的 Argo 协议: $protocol"; return 1;;
+esac
 
-    _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
+_info "--- 创建 ${protocol_label} + Argo 隧道节点 (cloudflared 入站) ---"
 
-    # 安装 cloudflared
-    _install_cloudflared || return 1
+read -r -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
+local port="$input_port"
+while true; do
+if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
+_check_port_conflict "$port" "tcp" && port="" && continue
+_info "已使用监听端口: ${port}"
+break
+else
+[ -n "$port" ] && _warning "端口格式无效，将重新生成..."
+port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000))
+_info "正在尝试分配随机内部端口: ${port}..."
+fi
+done
 
-    # === [公共] 内部端口分配 ===
-    read -p "请输入 Argo 内部监听端口 (回车随机生成): " input_port
-    local port="$input_port"
+read -r -p "请输入传输路径 (回车随机生成): " ws_path
+if [ -z "$ws_path" ]; then
+ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+_info "已生成随机路径: ${ws_path}"
+else
+[[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
+fi
 
-    while true; do
-        if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then
-            _check_port_conflict "$port" "tcp" && port="" && continue
-            _info "已使用监听端口: ${port}"
-            break
-        else
-            [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
-            # 使用内建算法生成随机端口 (10000-60000)，移除 shuf 依赖
-            port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
-            _info "正在尝试分配随机内部端口: ${port}..."
-        fi
-    done
+local token=""
+local tunnel_domain=""
+echo ""
+_info "请输入 Zero Trust 命名隧道 token (Networks -> Tunnels -> Install connector 里那个 Base64 token, eyJ 开头)。"
+read -r -p "Token: " input_token
+token=$(_argo_extract_token "$input_token")
+if [ -z "$token" ] || ! _argo_token_is_valid "$token"; then
+_error "Token 格式无效: 应为 Zero Trust 后台的 Base64 token (eyJ 开头)。"
+return 1
+fi
+read -r -p "域名 (Zero Trust 里配好的 Public Hostname, 例如 tunnel.example.com): " input_domain
+if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
+tunnel_domain="$input_domain"
+echo ""
+_info "请务必确认 Zero Trust 里该隧道的 Public Hostname 已配好:"
+_info " Public Hostname: ${tunnel_domain}"
+if [ "$protocol" == "vless-xhttp-enc" ]; then
+_info " Service: http://127.0.0.1:${port}"
+_info " (XHTTP 源站不加 TLS; 隧道设置里不要开 http2Origin 与 noTLSVerify)"
+else
+_info " Service: http://127.0.0.1:${port}"
+_info " (Service 只能指向这一个端口; 域名固定, 重启也不会变。)"
+fi
+echo ""
+read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
+echo ""
 
-    # === [公共] WebSocket 路径 ===
-    read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
-    if [ -z "$ws_path" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-        _info "已生成随机路径: ${ws_path}"
-    else
-        [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
-    fi
+local default_name="Argo-${proto_name}-${port}"
+read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
+local name=${custom_name:-$default_name}
 
-    # === [协议特定] Trojan 密码输入 ===
-    local password=""
-    if [ "$protocol" == "trojan" ]; then
-        read -p "请输入 Trojan 密码 (回车随机生成): " password
-        if [ -z "$password" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            _info "已生成随机密码: ${password}"
-        fi
-    fi
+local tag="argo-${protocol}-${port}"
+local uuid=""
+local inbound_json=""
+local client_encryption="" server_decryption=""
 
-    # === [公共] 隧道模式选择 ===
-    echo ""
-    echo "请选择隧道模式:"
-    echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定，重启失效)"
-    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久，重启不失效)"
-    read -p "请选择 [1/2] (默认: 1): " tunnel_mode
-    tunnel_mode=${tunnel_mode:-1}
+if [[ "$protocol" == "vless-xhttp-enc" || "$protocol" == "vless-ws-enc" ]]; then
+uuid=$(${SINGBOX_BIN} generate uuid)
+local keypair private_key public_key
+keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+fi
 
-    local token=""
-    local tunnel_domain=""
-    local argo_type="temp"
+if [ "$protocol" == "vless-xhttp-enc" ]; then
+inbound_json=$(jq -n \
+--arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg xp "$ws_path" \
+'{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"xhttp",path:$xp,x_padding_bytes:"100-1000"}}')
+elif [ "$protocol" == "vless-ws-enc" ]; then
+inbound_json=$(jq -n \
+--arg t "$tag" --arg p "$port" --arg u "$uuid" --arg dec "$server_decryption" --arg wsp "$ws_path" \
+--argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+'{type:"vless",tag:$t,listen:"127.0.0.1",listen_port:($p|tonumber),users:[{uuid:$u,flow:"xtls-rprx-vision"}],decryption:$dec,transport:{type:"ws",path:$wsp,max_early_data:$ed,early_data_header_name:$edh}}')
+fi
 
-    if [ "$tunnel_mode" == "2" ]; then
-        argo_type="fixed"
-        _info "您选择了 [固定隧道] 模式。"
-        echo ""
-        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴CF网页端所给出的任何安装命令):"
-        read -p "Token: " input_token
-        # 自动提取 Token
-        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
-        if [ -z "$token" ]; then
-             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
-        fi
-        if [ -z "$token" ]; then
-             token="$input_token"
-        fi
+_atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb]' --argjson inb "$inbound_json" || return 1
+if ! _add_cloudflared_inbound "$port" "$token"; then
+return 1
+fi
+local argo_meta=$(jq -n \
+--arg tag "$tag" --arg name "$name" --arg domain "$tunnel_domain" --arg port "$port" \
+--arg uuid "$uuid" --arg pw "" --arg enc "$client_encryption" --arg dec "$server_decryption" \
+--arg path "$ws_path" --arg protocol "$protocol" --arg type "named" --arg token "$token" \
+--arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
+'{($tag): {name:$name, domain:$domain, local_port:($port|tonumber), uuid:$uuid, password:$pw, encryption:$enc, decryption:$dec, path:$path, protocol:$protocol, type:$type, token:$token, created_at:$created}}')
+[ ! -f "$ARGO_METADATA_FILE" ] && echo '{}' > "$ARGO_METADATA_FILE"
+_atomic_modify_json "$ARGO_METADATA_FILE" '. + $meta' --argjson meta "$argo_meta" || return 1
 
-        if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
-        _info "已识别 Token (前20位): ${token:0:20}..."
+local proxy_json=""
+if [ "$protocol" == "vless-xhttp-enc" ]; then
+proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" --arg enc "$client_encryption" --arg xp "$ws_path" \
+'{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:"xtls-rprx-vision", encryption:$enc, tls:true, udp:true, "skip-cert-verify":false, network:"xhttp", servername:$s, alpn:["h2"], "ech":true, "xhttp-opts":{path:$xp, headers:{Host:$s}}}')
+elif [ "$protocol" == "vless-ws-enc" ]; then
+proxy_json=$(jq -n --arg n "$name" --arg s "$tunnel_domain" --arg u "$uuid" --arg enc "$client_encryption" --arg wsp "$ws_path" \
+--argjson ed "$WS_EARLY_DATA_SIZE" --arg edh "$WS_EARLY_DATA_HEADER" \
+'{name:$n, type:"vless", server:$s, port:443, uuid:$u, flow:"xtls-rprx-vision", encryption:$enc, tls:true, udp:true, "skip-cert-verify":false, network:"ws", servername:$s, "ech":true, "ws-opts":{path:$wsp, "max-early-data":$ed, "early-data-header-name":$edh, headers:{Host:$s}}}')
+fi
 
-        echo ""
-        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
-        read -p "域名 (例如 tunnel.example.com): " input_domain
-        if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
-        tunnel_domain="$input_domain"
+if ! _add_node_to_yaml "$proxy_json"; then
+return 1
+fi
 
-        echo ""
-        _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
-        _info "  Public Hostname: ${tunnel_domain}"
-        _info "  Service: http://localhost:${port}"
-        echo ""
-        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
-        echo ""
-    else
-        _info "您选择了 [临时隧道] 模式。"
-    fi
+echo ""
+_info "${protocol_label} + Argo 节点配置已生成，正在校验并重启生效... (cloudflared 入站)"
+echo "-------------------------------------------"
+echo -e "节点名称: ${GREEN}${name}${NC}"
+echo -e "隧道类型: ${CYAN}named (命名隧道)${NC}"
+echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
+echo -e "本地端口: ${port}"
+echo "-------------------------------------------"
 
-    # === [公共] 节点名称 ===
-    local default_prefix="Argo-Temp"
-    if [ "$argo_type" == "fixed" ]; then
-        default_prefix="Argo-Fixed"
-    fi
-    local default_name="${default_prefix}-${proto_name}-${port}"
-
-    echo ""
-    read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-    local name=${custom_name:-$default_name}
-
-    # === [协议特定] 生成凭据、tag 和 Inbound ===
-    local tag="argo-${protocol}-ws-${port}"
-    local uuid=""
-    local inbound_json=""
-
-    if [ "$protocol" == "vless" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
-        inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "vless",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"uuid": $u, "flow": ""}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
-    elif [ "$protocol" == "trojan" ]; then
-        inbound_json=$(jq -n \
-            --arg t "$tag" \
-            --arg p "$port" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "type": "trojan",
-                "tag": $t,
-                "listen": "127.0.0.1",
-                "listen_port": ($p|tonumber),
-                "users": [{"password": $pw}],
-                "transport": {
-                    "type": "ws",
-                    "path": $wsp,
-                    "max_early_data": $ed,
-                    "early_data_header_name": $edh
-                }
-            }')
-    fi
-
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
-
-    # === [公共] 重启 + 启动隧道 ===
-    _manage_service "restart"
-    sleep 2
-
-    if [ "$argo_type" == "fixed" ]; then
-        if ! _start_argo_tunnel "$port" "${protocol}-ws" "$token"; then
-             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-             _manage_service "restart"
-             return 1
-        fi
-    else
-        local real_domain=$(_start_argo_tunnel "$port" "${protocol}-ws")
-        if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
-            _error "隧道启动失败，正在回滚配置..."
-            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-            _manage_service "restart"
-            return 1
-        fi
-        tunnel_domain="$real_domain"
-    fi
-
-    # === [协议特定] 保存元数据 ===
-    local credential_key="" credential_val=""
-    if [ "$protocol" == "vless" ]; then
-        credential_key="uuid"; credential_val="$uuid"
-    else
-        credential_key="password"; credential_val="$password"
-    fi
-
-    local argo_meta=$(jq -n \
-        --arg tag "$tag" \
-        --arg name "$name" \
-        --arg domain "$tunnel_domain" \
-        --arg port "$port" \
-        --arg cred_val "$credential_val" \
-        --arg cred_key "$credential_key" \
-        --arg path "$ws_path" \
-        --arg protocol "${protocol}-ws" \
-        --arg type "$argo_type" \
-        --arg token "$token" \
-        --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), ($cred_key): $cred_val, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
-
-    if [ ! -f "$ARGO_METADATA_FILE" ]; then
-        echo '{}' > "$ARGO_METADATA_FILE"
-    fi
-    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
-
-    # === [协议特定] Clash 配置 + 分享链接 ===
-    local proxy_json=""
-    if [ "$protocol" == "vless" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg u "$uuid" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "vless",
-                "server": $s,
-                "port": 443,
-                "uuid": $u,
-                "tls": true,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "servername": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
-    elif [ "$protocol" == "trojan" ]; then
-        proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$tunnel_domain" \
-            --arg pw "$password" \
-            --arg wsp "$ws_path" \
-            --argjson ed "$WS_EARLY_DATA_SIZE" \
-            --arg edh "$WS_EARLY_DATA_HEADER" \
-            '{
-                "name": $n,
-                "type": "trojan",
-                "server": $s,
-                "port": 443,
-                "password": $pw,
-                "udp": true,
-                "skip-cert-verify": false,
-                "network": "ws",
-                "sni": $s,
-                "ws-opts": {
-                    "path": $wsp,
-                    "max-early-data": $ed,
-                    "early-data-header-name": $edh,
-                    "headers": {
-                        "Host": $s
-                    }
-                }
-            }')
-    fi
-
-    if ! _add_node_to_yaml "$proxy_json"; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    # === [公共] 启用守护 + 显示结果 ===
-    # 守护是 Argo 节点的完整性条件；失败时回滚本次节点，避免产生
-    # 表面创建成功但重启后无法自愈的半成品状态。
-    if ! _enable_argo_watchdog; then
-        _stop_argo_tunnel "$port"
-        _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" >/dev/null 2>&1 || true
-        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" >/dev/null 2>&1 || true
-        _remove_node_from_yaml "$name" >/dev/null 2>&1 || true
-        _manage_service "restart" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    echo ""
-    _success "${protocol_label} + Argo 节点创建成功!"
-    echo "-------------------------------------------"
-    echo -e "节点名称: ${GREEN}${name}${NC}"
-    echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
-    echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
-    echo -e "本地端口: ${port}"
-    echo "-------------------------------------------"
-    
-    # 使用统一链接生成器进行展示与持久化
-    if [ "$protocol" == "vless" ]; then
-        _show_node_link "vless-ws" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path"
-    else
-        _show_node_link "trojan-ws" "$name" "$tunnel_domain" "443" "$tag" "$password" "$ws_path"
-    fi
-    
-    echo "-------------------------------------------"
-    if [ "$argo_type" == "temp" ]; then
-        _warning "注意: 临时隧道每次重启域名会变化！"
-    fi
+if [ "$protocol" == "vless-xhttp-enc" ]; then
+_show_node_link "vless-xhttp-argo" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path" "$client_encryption" || return 1
+elif [ "$protocol" == "vless-ws-enc" ]; then
+_show_node_link "vless-ws-enc-argo" "$name" "$tunnel_domain" "443" "$tag" "$uuid" "$ws_path" "$client_encryption" || return 1
+fi
+echo "-------------------------------------------"
 }
 
-# 保留原始函数名作为薄包装器，确保向后兼容
-_add_argo_vless_ws() { _add_argo_node "vless"; }
+_add_argo_vless_xhttp_enc() { _add_argo_node "vless-xhttp-enc"; }
+_add_argo_vless_ws_enc() { _add_argo_node "vless-ws-enc"; }
 
-_add_argo_trojan_ws() { _add_argo_node "trojan"; }
-
-_view_argo_nodes() {
-    _info "--- Argo 隧道节点信息 ---"
-    
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点。"
-        return
-    fi
-    
-    echo "==================================================="
-    # 遍历并显示
-    jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.type)|\(.value.protocol)|\(.value.local_port)|\(.value.domain)|\(.value.uuid // "")|\(.value.path // "")|\(.value.password // "")"' "$ARGO_METADATA_FILE" | \
-    while IFS='|' read -r tag name argo_type protocol port domain uuid path password; do
-        echo -e "节点: ${GREEN}${name}${NC}"
-        echo -e "  协议: ${protocol}"
-        echo -e "  端口: ${port}"
-        
-        # 检查状态
-        local pid_file
-        _migrate_legacy_argo_state "$port" >/dev/null 2>&1 || true
-        pid_file=$(_argo_pid_file "$port")
-        local state="${RED}已停止${NC}"
-        local running_domain=""
-        
-        # [M4] 一次读取 PID 到变量，避免重复 cat
-        local pid=""
-        if [ -f "$pid_file" ]; then pid=$(cat "$pid_file" 2>/dev/null); fi
-        if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
-             state="${GREEN}运行中${NC} (PID: $pid)"
-             # 如果是临时的，尝试从 log 读最新域名
-             if [ "$argo_type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
-                  local log_file
-                  log_file=$(_argo_log_file "$port")
-                  local temp_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -1 | sed 's|https://||')
-                   [ -n "$temp_domain" ] && domain="$temp_domain"
-             fi
-             running_domain="$domain"
-        fi
-        
-        if [ -n "$domain" ] && [ "$domain" != "null" ]; then
-             local link=""
-             
-             # [新架构] 优先使用持久化链接
-             link=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE")
-             
-              if [ -z "$link" ] || [ "$link" == "null" ]; then
-                  local safe_name=$(_url_encode "$name")
-                  local ed_path=$(_ws_path_with_early_data "$path")
-                  local safe_path=$(_url_encode "$ed_path")
-                  
-                  if [[ "$protocol" == "vless-ws" ]]; then
-                      link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
-                 elif [[ "$protocol" == "trojan-ws" ]]; then
-                     local safe_pw=$(_url_encode "$password")
-                     link="trojan://${safe_pw}@${domain}:443?security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
-                 fi
-             fi
-
-             if [ -n "$link" ]; then
-                  echo -e "  ${YELLOW}链接:${NC} $link"
-             fi
-        fi
-        echo "-------------------------------------------"
-    done
-    
-    echo -e "${YELLOW}提示: 请使用 [9] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
-    echo "==================================================="
+_sync_argo_domain_to_yaml() {
+    local proxy_name="$1" new_domain="$2"
+    [ -n "$proxy_name" ] && [ -n "$new_domain" ] && [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] || return 0
+    export PROXY_NAME="$proxy_name" NEW_DOMAIN="$new_domain"
+    _atomic_modify_yaml "$CLASH_YAML_FILE" '
+        (.proxies[] | select(.name == env(PROXY_NAME))) |= (
+            .server = env(NEW_DOMAIN)
+            | .servername = env(NEW_DOMAIN)
+            | if .["ws-opts"] then .["ws-opts"].headers.Host = env(NEW_DOMAIN) else . end
+            | if .["xhttp-opts"] then .["xhttp-opts"].headers.Host = env(NEW_DOMAIN) else . end
+        )
+    ' >/dev/null 2>&1 || true
 }
 
-_delete_argo_node() {
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点可删除。"
-        return
-    fi
-    
-    _info "--- 删除 Argo 隧道节点 ---"
-    
-    # 读取所有节点到数组
-    local i=1
-    local keys=()
-    local names=()
-    local ports=()
-    
-    # 必须使用 while read 处理 process substitution 避免子 shell 问题
-    while IFS='|' read -r key name port; do
-        keys+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
-        ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
-    
-    if [ ${#keys[@]} -eq 0 ]; then
-         _warning "读取元数据失败。"
-         return
-    fi
-
-    echo " 0) 返回"
-    read -p "请选择要删除的节点: " choice
-    
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "${#keys[@]}" ]; then
-        _error "无效输入"
-        return
-    fi
-    
-    if [ "$choice" -eq 0 ]; then return; fi
-    
-    local idx=$((choice - 1))
-    local selected_key="${keys[$idx]}"
-    local selected_name="${names[$idx]}"
-    local selected_port="${ports[$idx]}"
-    
-    _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
-    
-    # 1. 停止该节点的隧道进程
-    _stop_argo_tunnel "$selected_port"
-    
-    # 2. 从 sing-box 配置文件中移除 inbound
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
-    
-    # 3. 删除 Argo 元数据
-    _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$selected_key"
-    
-    # 4. 删除 Clash 配置
-    _remove_node_from_yaml "$selected_name"
-    
-    # 5. 检查是否还有节点，如果没有则禁用守护进程
-    if [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        _disable_argo_watchdog
-    fi
-
-    # 6. 重启 sing-box
-    _manage_service "restart"
-    
-    _success "节点 ${selected_name} 已删除！"
-}
-
-_stop_argo_menu() {
-    _info "--- 停止 Argo 隧道进程 (保留配置) ---"
-    # 复用选择逻辑
-    local i=1
-    local keys=()
-    local names=()
-    local ports=()
-    
-    while IFS='|' read -r key name port; do
-        keys+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
-        ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
-    
-    echo " a) 停止所有运行中的隧道"
-    echo " 0) 返回"
-    read -p "请选择: " choice
-    
-    if [ "$choice" == "a" ]; then
-        _stop_all_argo_tunnels
-        _success "所有隧道已停止指令发送。"
-        return
-    fi
-    
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "${#keys[@]}" ]; then
-        _error "无效输入"
-        return
-    fi
-    if [ "$choice" -eq 0 ]; then return; fi
-    
-    local idx=$((choice - 1))
-    local selected_port="${ports[$idx]}"
-    
-    _stop_argo_tunnel "$selected_port"
-}
-
-_restart_argo_tunnel_menu() {
-    _info "--- 重启 Argo 隧道 ---"
-    
-     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点。"
-        return
-    fi
-
-    # 选择逻辑
-    local i=1
-    local keys=()
-    local names=()
-    local ports=()
-    local protocols=()
-    local types=()
-    local tokens=()
-    
-    while IFS='|' read -r key name port proto type token; do
-        keys+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        protocols+=("$proto")
-        types+=("$type")
-        tokens+=("$token")
-        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
-        ((i++))
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token)"' "$ARGO_METADATA_FILE")
-    
-    echo " a) 重启所有节点"
-    echo " 0) 返回"
-    read -p "请选择: " choice
-    
-    local selected_indices=()
-    if [ "$choice" == "a" ]; then
-        # 生成所有索引
-        for ((j=0; j<${#keys[@]}; j++)); do selected_indices+=("$j"); done
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#keys[@]}" ]; then
-        selected_indices+=($((choice - 1)))
-    else
-        if [ "$choice" -ne 0 ]; then _error "无效输入"; fi
-        return
-    fi
-
-    # 增强参数提取，为同步链接做准备
-    local names=() ports=() protocols=() types=() tokens=() tags=() uuids=() passwords=() paths=()
-    while IFS='|' read -r key name port proto type token uuid pw path; do
-        tags+=("$key")
-        names+=("$name")
-        ports+=("$port")
-        protocols+=("$proto")
-        types+=("$type")
-        tokens+=("$token")
-        uuids+=("$uuid")
-        passwords+=("$pw")
-        paths+=("$path")
-    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token // "")|\(.value.uuid // "")|\(.value.password // "")|\(.value.path // "")"' "$ARGO_METADATA_FILE")
-
-    # 手动重启也要先确认守护可用，避免停掉现有隧道后才发现 cron 不工作。
-    _enable_argo_watchdog || return 1
-
-    for i in "${!selected_indices[@]}"; do
-        local idx="${selected_indices[$i]}"
-        local tag="${tags[$idx]}"
-        local name="${names[$idx]}"
-        local port="${ports[$idx]}"
-        local proto_full="${protocols[$idx]}"
-        local type="${types[$idx]}"
-        local token="${tokens[$idx]}"
-        local uuid="${uuids[$idx]}"
-        local password="${passwords[$idx]}"
-        local ws_path="${paths[$idx]}"
-        
-        # 提取 protocol 简写用于 _start_argo_tunnel (vless/trojan)
-        local proto_short="vless"
-        [[ "$proto_full" == "trojan-ws" ]] && proto_short="trojan"
-
-        _info "正在重启: $name (端口: $port)..."
-        
-        # 停止
-        _stop_argo_tunnel "$port"
-        sleep 1
-        
-        # 启动
-        local new_domain=""
-        if [ "$type" == "fixed" ]; then
-            if _start_argo_tunnel "$port" "$proto_short-ws" "$token"; then
-                 new_domain=$(jq -r --arg tag "$tag" '.[$tag].domain // empty' "$ARGO_METADATA_FILE")
-            else
-                 _error "固定隧道重启失败: $name"
-            fi
-        else
-            new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
-            if [ -n "$new_domain" ]; then
-                 _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' \
-                     --arg tag "$tag" --arg domain "$new_domain"
-                 _success "更新临时域名: $new_domain"
-                 
-                 # [同步链接] 临时域名变动，立即重新持久化链接
-                 if [[ "$proto_full" == "vless-ws" ]]; then
-                     _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$ws_path" >/dev/null
-                 else
-                     _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$ws_path" >/dev/null
-                 fi
-            else
-                 _error "临时隧道重启失败: $name"
-            fi
-        fi
-    done
-    _success "操作完成。"
-}
-
-# --- Argo 守护进程逻辑 ---
-
-_argo_keepalive() {
-    # keepalive 使用受保护运行目录中的 flock，避免可预测 /tmp 锁和并发重启。
-    _prepare_argo_runtime_dir || return 1
-    command -v flock >/dev/null 2>&1 || { _error "缺少 flock，Argo 守护任务已拒绝无锁运行。"; return 1; }
-    exec 7>"${RUNTIME_DIR}/argo-keepalive.lock" || return 1
-    flock -n 7 || { exec 7>&-; return 0; }
-
-    # --- 性能优化: 日志轮转 (10MB) ---
-    local max_size=$((10 * 1024 * 1024))
-    local log_size
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
-        log_size=0
-        [ -f "$log" ] && log_size=$(wc -c < "$log" 2>/dev/null || echo 0)
-        if [[ "$log_size" =~ ^[0-9]+$ ]] && [ "$log_size" -ge "$max_size" ]; then
-            local log_tmp
-            log_tmp=$(mktemp "${log}.tmp.XXXXXX") || continue
-            if tail -n 1000 "$log" > "$log_tmp"; then
-                chmod 600 "$log_tmp" 2>/dev/null || true
-                mv -f "$log_tmp" "$log"
-            else
-                rm -f "$log_tmp"
-            fi
-        fi
-    done
-
-    # 如果元数据文件不存在或为空，不需要守护
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        flock -u 7 2>/dev/null || true
-        exec 7>&-
-        return
-    fi
-
-    # 遍历所有节点。这里不能使用 TSV 配合 IFS=$'\t'：临时隧道的 token
-    # 必然为空，而 Bash 会折叠连续的空白 IFS 字符，导致 protocol/name/uuid
-    # 整体左移，守护重启后甚至会把 UUID 误写成节点名称。逐条读取紧凑 JSON
-    # 可同时正确保留空字段以及名称、路径中的空格和分隔符。
-    local entry tag port type token protocol name uuid password path
-    while IFS= read -r entry; do
-        [ -z "$entry" ] && continue
-        tag=$(jq -r '.key // empty' <<< "$entry")
-        port=$(jq -r '.value.local_port // empty' <<< "$entry")
-        type=$(jq -r '.value.type // ""' <<< "$entry")
-        token=$(jq -r '.value.token // ""' <<< "$entry")
-        protocol=$(jq -r '.value.protocol // "vless-ws"' <<< "$entry")
-        name=$(jq -r '.value.name // ""' <<< "$entry")
-        uuid=$(jq -r '.value.uuid // ""' <<< "$entry")
-        password=$(jq -r '.value.password // ""' <<< "$entry")
-        path=$(jq -r '.value.path // ""' <<< "$entry")
-        [ -z "$tag" ] && continue
-        [[ "$port" =~ ^[0-9]+$ ]] || {
-            logger "sing-box-watchdog: Ignoring invalid Argo metadata entry: $tag"
-            continue
-        }
-        
-        local pid_file
-        _migrate_legacy_argo_state "$port" >/dev/null 2>&1 || true
-        pid_file=$(_argo_pid_file "$port")
-        local is_running=false
-        
-        if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file" 2>/dev/null)
-            if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
-                is_running=true
-            fi
-        fi
-        
-        if [ "$is_running" = false ]; then
-            logger "sing-box-watchdog: Detected dead tunnel for $tag (Port: $port). Restarting..."
-            
-            # 提取 protocol 简写用于 _start_argo_tunnel (vless/trojan)
-            local proto_short="vless"
-            [[ "$protocol" == "trojan-ws" ]] && proto_short="trojan"
-
-            if [ "$type" == "fixed" ] && [ -n "$token" ]; then
-                 if _start_argo_tunnel "$port" "$proto_short-ws" "$token"; then
-                     logger "sing-box-watchdog: Fixed tunnel $tag restarted successfully."
-                 else
-                     logger "sing-box-watchdog: Failed to restart fixed tunnel $tag."
-                 fi
-            else
-                 # 临时隧道
-                 local new_domain=$(_start_argo_tunnel "$port" "$proto_short-ws")
-                 if [ -n "$new_domain" ]; then
-                      # 更新元数据
-                      _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' \
-                          --arg tag "$tag" --arg domain "$new_domain"
-                      logger "sing-box-watchdog: Temp tunnel $tag restarted with new domain: $new_domain"
-                      
-                      # [同步链接] 临时域名变动，静默更新持久化链接
-                      if [[ "$protocol" == "vless-ws" ]]; then
-                          _show_node_link "vless-ws" "$name" "$new_domain" "443" "$tag" "$uuid" "$path" >/dev/null
-                      else
-                          _show_node_link "trojan-ws" "$name" "$new_domain" "443" "$tag" "$password" "$path" >/dev/null
-                      fi
-                 else
-                      logger "sing-box-watchdog: Failed to restart temp tunnel $tag."
-                 fi
-            fi
-        fi
-    done < <(jq -c 'to_entries[]' "$ARGO_METADATA_FILE" 2>/dev/null)
-    flock -u 7 2>/dev/null || true
-    exec 7>&-
-}
 
 _cron_daemon_running() {
     local name comm
@@ -2837,7 +1817,7 @@ _cron_daemon_running() {
     return 1
 }
 
-_ensure_argo_cron() {
+_ensure_cron_daemon() {
     local cron_pkg="cron"
     local services=(cron crond cronie)
     local service_name started=false service_available=false
@@ -2850,17 +1830,16 @@ _ensure_argo_cron() {
         services=(crond cronie)
     fi
 
-    # Alpine 自带 BusyBox crontab/crond，但通常没有 OpenRC 的 cron 服务。
-    # 仅按 crontab 命令判断会在创建节点时临时启动 crond，重启后却无人执行守护任务。
+    # Alpine 有 BusyBox crond 却常无 OpenRC cron 服务, 只看 crontab 命令会误判。
     for service_name in "${services[@]}"; do
         [ ! -x "/etc/init.d/$service_name" ] || service_available=true
     done
     if ! command -v crontab &>/dev/null \
         || { [ "${INIT_SYSTEM:-}" = openrc ] && [ -s /run/openrc/softlevel ] \
              && [ "$service_available" != true ]; }; then
-        _info "正在按需安装 Argo 守护依赖: ${cron_pkg}..."
+        _info "正在按需安装 cron 依赖: ${cron_pkg}..."
         if ! _pkg_install "$cron_pkg" || ! command -v crontab &>/dev/null; then
-            _error "安装 Argo 守护依赖失败，未创建不受守护的隧道节点。"
+            _error "安装 cron 依赖失败，内存守护无法启用。"
             return 1
         fi
     fi
@@ -2880,19 +1859,19 @@ _ensure_argo_cron() {
                     [ -x "/etc/init.d/$service_name" ] || continue
                     if ! rc-update add "$service_name" default >/dev/null 2>&1 \
                         || [ ! -L "/etc/runlevels/default/$service_name" ]; then
-                        _error "无法把 ${service_name} 加入 OpenRC default 运行级别；重启后 Argo 无法自启。"
+                        _error "无法把 ${service_name} 加入 OpenRC default 运行级别；重启后 cron 无法自启。"
                         return 1
                     fi
                     if ! rc-service "$service_name" start >/dev/null 2>&1 \
                         || ! rc-service "$service_name" status >/dev/null 2>&1; then
-                        _error "OpenRC ${service_name} 服务未运行；无法启用 Argo 自动守护。"
+                        _error "OpenRC ${service_name} 服务未运行；无法启用内存守护。"
                         return 1
                     fi
                     started=true
                     break
                 done
                 if [ "$started" != true ]; then
-                    _error "没有可用的 OpenRC cron 服务；无法保证 Argo 重启后自动恢复。"
+                    _error "没有可用的 OpenRC cron 服务；无法保证重启后 cron 自动恢复。"
                     return 1
                 fi
             fi
@@ -2920,150 +1899,201 @@ _ensure_argo_cron() {
     if _cron_daemon_running; then started=true; else started=false; fi
 
     if [ "$started" != true ]; then
-        _error "未检测到运行中的 cron/crond，无法启用 Argo 自动守护。请检查服务状态和容器进程权限。"
+        _error "未检测到运行中的 cron/crond，无法启用内存守护。请检查服务状态和容器进程权限。"
         return 1
     fi
 }
 
-_enable_argo_watchdog() {
-    # Podman 低内存安装会跳过可选包；仅在使用 Argo 时按需安装 cron。
-    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
 
-    _ensure_argo_cron || return 1
-    if crontab -l 2>/dev/null | grep -Fq "$job"; then
+# ---------- 内存释放守护 ----------
+MEMWATCH_THRESHOLD_PCT="${MEMWATCH_THRESHOLD_PCT:-70}"
+
+# 生效阈值: 64MB 机器 90%, 其余机器用 MEMWATCH_THRESHOLD_PCT (默认 70)。
+_memwatch_threshold() {
+    local threshold="$MEMWATCH_THRESHOLD_PCT"
+    [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=70
+    if [ "$threshold" -lt 50 ] || [ "$threshold" -gt 90 ]; then threshold=70; fi
+    if [ "$(_memwatch_total_mb)" -le 64 ]; then threshold=90; fi
+    echo "$threshold"
+}
+
+_memwatch_total_mb() {
+    local total_mb=0 cgroup_limit="" candidate_mb=0 limit_file
+    total_mb=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
+    [[ "$total_mb" =~ ^[0-9]+$ ]] || total_mb=0
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        for limit_file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.high; do
+            [ -r "$limit_file" ] || continue
+            cgroup_limit=$(cat "$limit_file" 2>/dev/null)
+            if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+                candidate_mb=$((cgroup_limit / 1024 / 1024))
+                if [ "$candidate_mb" -gt 0 ] && { [ "$total_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mb" ]; }; then
+                    total_mb=$candidate_mb
+                fi
+            fi
+        done
+    elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        cgroup_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+        if [[ "$cgroup_limit" =~ ^[0-9]+$ ]] && [ "$cgroup_limit" -lt 9223372036854771712 ] 2>/dev/null; then
+            candidate_mb=$((cgroup_limit / 1024 / 1024))
+            if [ "$candidate_mb" -gt 0 ] && { [ "$total_mb" -eq 0 ] || [ "$candidate_mb" -lt "$total_mb" ]; }; then
+                total_mb=$candidate_mb
+            fi
+        fi
+    fi
+    [ "$total_mb" -gt 0 ] || total_mb=128
+    echo "$total_mb"
+}
+
+_memwatch_used_mb() {
+    local hard_bytes=0 key="" val=""
+    # memory.stat 里只加 anon+kernel+sock+shmem, 其余都是子项或页缓存, 不重复加。
+    if [ -r /sys/fs/cgroup/memory.stat ]; then
+        while read -r key val; do
+            case "$key" in
+                anon|kernel|sock|shmem)
+                    [[ "$val" =~ ^[0-9]+$ ]] || continue
+                    hard_bytes=$((hard_bytes + val))
+                    ;;
+            esac
+        done < /sys/fs/cgroup/memory.stat
+        if [ "$hard_bytes" -gt 0 ]; then
+            echo $((hard_bytes / 1024 / 1024))
+            return 0
+        fi
+        # memory.stat 读不到有效项时回退: memory.current - file (页缓存)。
+        local current_bytes=0 file_bytes=0
+        current_bytes=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)
+        file_bytes=$(awk '/^file /{print $2; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null)
+        if [[ "$current_bytes" =~ ^[0-9]+$ ]] && [[ "$file_bytes" =~ ^[0-9]+$ ]] \
+            && [ "$current_bytes" -ge "$file_bytes" ]; then
+            echo $(((current_bytes - file_bytes) / 1024 / 1024))
+            return 0
+        fi
+    fi
+    # cgroup v1 回退: usage_in_bytes - total_cache (页缓存)。
+    if [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ] \
+        && [ -r /sys/fs/cgroup/memory/memory.stat ]; then
+        local usage_bytes=0 cache_bytes=0
+        usage_bytes=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)
+        cache_bytes=$(awk '/^total_cache/{print $2; exit}' /sys/fs/cgroup/memory/memory.stat 2>/dev/null)
+        if [[ "$usage_bytes" =~ ^[0-9]+$ ]] && [[ "$cache_bytes" =~ ^[0-9]+$ ]] \
+            && [ "$usage_bytes" -ge "$cache_bytes" ]; then
+            echo $(((usage_bytes - cache_bytes) / 1024 / 1024))
+            return 0
+        fi
+    fi
+    # 最后回退: 旧口径 memory.current / usage_in_bytes / MemTotal-MemAvailable。
+    local bytes=""
+    if [ -r /sys/fs/cgroup/memory.current ]; then
+        bytes=$(cat /sys/fs/cgroup/memory.current 2>/dev/null)
+        [[ "$bytes" =~ ^[0-9]+$ ]] && { echo $((bytes / 1024 / 1024)); return 0; }
+    fi
+    if [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+        bytes=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)
+        [[ "$bytes" =~ ^[0-9]+$ ]] && { echo $((bytes / 1024 / 1024)); return 0; }
+    fi
+    local mem_total=0 mem_avail=0
+    mem_total=$(awk '/^MemTotal:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null)
+    if [ "$mem_total" -gt 0 ] && [ "$mem_avail" -ge 0 ]; then
+        echo $((mem_total - mem_avail))
+    else
+        echo 0
+    fi
+}
+
+_memwatch_singbox_rss_mb() {
+    local total_rss=0 proc_dir comm rss=0
+    for proc_dir in /proc/[0-9]*; do
+        [ -r "$proc_dir/comm" ] || continue
+        IFS= read -r comm < "$proc_dir/comm" 2>/dev/null || continue
+        [ "$comm" = "sing-box" ] || continue
+        [ -r "$proc_dir/cmdline" ] || continue
+        tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null | grep -Fq "$SINGBOX_BIN" || continue
+        rss=$(awk '/^VmRSS:/{print int($2 / 1024); exit}' "$proc_dir/status" 2>/dev/null)
+        [[ "$rss" =~ ^[0-9]+$ ]] && total_rss=$((total_rss + rss))
+    done
+    echo "$total_rss"
+}
+
+_memwatch() {
+    local threshold total_mb used_mb pct sb_rss state_file lock_file
+    threshold="$(_memwatch_threshold)"
+    mkdir -p "$RUNTIME_DIR" 2>/dev/null || return 0
+    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+    lock_file="${RUNTIME_DIR}/memwatch.lock"
+    state_file="${RUNTIME_DIR}/memwatch-over-threshold"
+    exec 8>"$lock_file" 2>/dev/null || return 0
+    if command -v flock >/dev/null 2>&1; then
+        flock -n 8 2>/dev/null || { exec 8>&-; return 0; }
+    fi
+    # 没有 flock 的机器不静默退出, 只失去并发互斥, 状态文件仍能防重复重启。
+    total_mb=$(_memwatch_total_mb)
+    used_mb=$(_memwatch_used_mb)
+    sb_rss=$(_memwatch_singbox_rss_mb)
+    [ "$total_mb" -gt 0 ] || { exec 8>&-; return 0; }
+    pct=$((used_mb * 100 / total_mb))
+    if [ "$pct" -lt "$threshold" ]; then
+        rm -f -- "$state_file"
+        exec 8>&-
         return 0
     fi
+    # 第一次超标只记状态, 下次仍超标才认定持续占用, 不为一次突发断线。
+    if [ ! -f "$state_file" ]; then
+        printf '%s pct=%s used=%sMB total=%sMB singbox=%sMB\n' "$(date '+%F %T' 2>/dev/null)" "$pct" "$used_mb" "$total_mb" "$sb_rss" > "$state_file" 2>/dev/null || true
+        logger "sing-box-memwatch: 内存已用 ${pct}% (${used_mb}MB/${total_mb}MB), sing-box ${sb_rss}MB, 超过 ${threshold}% 一次, 下次仍超标才重启" 2>/dev/null || true
+        exec 8>&-
+        return 0
+    fi
+    # 第二次超标但 sing-box 不是主因时跳过并清状态, 避免每分钟空重启。
+    if [ "$sb_rss" -lt 20 ] && [ "$used_mb" -gt 0 ] && [ $((sb_rss * 100 / used_mb)) -lt 30 ]; then
+        logger "sing-box-memwatch: 内存已用 ${pct}% 但 sing-box 仅 ${sb_rss}MB, 不是主因, 跳过重启" 2>/dev/null || true
+        rm -f -- "$state_file"
+        exec 8>&-
+        return 0
+    fi
+    # 主脚本正在改配置（持 .singboxlite.lock）时跳过本轮重启，状态文件留着下次再判。
+    if command -v flock >/dev/null 2>&1 && exec 9>"${SINGBOX_DIR}/.singboxlite.lock" 2>/dev/null; then
+        if flock -n 9 2>/dev/null; then
+            exec 9>&-
+        else
+            logger "sing-box-memwatch: 检测到配置锁被占用，延后重启" 2>/dev/null || true
+            exec 9>&- 8>&-
+            return 0
+        fi
+    fi
+    logger "sing-box-memwatch: 内存已用 ${pct}% (${used_mb}MB/${total_mb}MB), sing-box ${sb_rss}MB, 连续两次超标, sync 后重启 sing-box 释放" 2>/dev/null || true
+    sync 2>/dev/null || true
+    rm -f -- "$state_file"
+    _manage_service restart >/dev/null 2>&1 || logger "sing-box-memwatch: 重启 sing-box 失败" 2>/dev/null || true
+    exec 8>&- 2>/dev/null || true
+}
 
-    _info "正在添加后台守护进程 (Watchdog)..."
+_enable_memwatch() {
+    local interval="* * * * *"
+    # 64MB 机器 5 分钟一查, 判据是机器总量而非 GOMEMLIMIT (64M 档上它会被调到 40MiB)。
+    [ "$(_memwatch_total_mb)" -le 64 ] && interval="*/5 * * * *"
+    local job="${interval} bash ${SELF_SCRIPT_PATH} memwatch >/dev/null 2>&1"
+    _ensure_cron_daemon || return 1
+    if crontab -l 2>/dev/null | grep -Fq "bash ${SELF_SCRIPT_PATH} memwatch"; then
+        return 0
+    fi
     if (crontab -l 2>/dev/null; echo "$job") | crontab -; then
-        _success "守护进程已启用！(每分钟检查并自动修复失效隧道)"
+        _success "内存释放守护已启用 (按 ${interval} 检查, 超过 $(_memwatch_threshold)% 连续两次超标重启 sing-box)"
         return 0
     fi
-
-    _error "添加 Crontab 失败，未创建不受守护的隧道节点。"
+    _error "添加内存守护 Crontab 失败"
     return 1
 }
 
-_disable_argo_watchdog() {
-    local job="bash ${SELF_SCRIPT_PATH} keepalive"
-    
+_disable_memwatch() {
+    local job="bash ${SELF_SCRIPT_PATH} memwatch"
     if crontab -l 2>/dev/null | grep -Fq "$job"; then
-        _info "正在移除后台守护进程..."
         crontab -l 2>/dev/null | grep -Fv "$job" | crontab -
-        _success "守护进程已移除。"
     fi
 }
 
-_uninstall_argo() {
-    _warning "！！！警告！！！"
-    _warning "本操作将删除所有 Argo 隧道节点和 cloudflared 程序。"
-    echo ""
-    echo "即将删除的内容："
-    echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
-    echo -e "  ${RED}-${NC} 所有 Argo 日志文件和元数据文件"
-    
-    if [ -f "$ARGO_METADATA_FILE" ]; then
-        local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
-        echo -e "  ${RED}-${NC} Argo 节点数量: ${argo_count} 个"
-    fi
-    
-    echo ""
-    read -p "$(echo -e ${YELLOW}"确定要卸载 Argo 服务吗? (y/N): "${NC})" confirm
-    
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        _info "卸载已取消。"
-        return
-    fi
-    
-    _info "正在卸载 Argo 服务..."
-    
-    # 1. 停止所有隧道进程
-    _stop_all_argo_tunnels
-    
-    # 2. 删除 sing-box 中的 Argo inbound 配置
-    if [ -f "$ARGO_METADATA_FILE" ]; then
-        # 先保存键数组；不要依赖空白拆词，也不要把键直接拼进 jq 程序。
-        local tags=()
-        mapfile -t tags < <(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
-        local tag node_name
-        for tag in "${tags[@]}"; do
-             if [ -n "$tag" ]; then
-                _info "正在删除 Argo 隧道: $tag ..."
-                node_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
-                _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" 2>/dev/null
-                _atomic_modify_json "$CONFIG_FILE" 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag"
-                
-                if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
-                    _remove_node_from_yaml "$node_name"
-                fi
-             fi
-        done
-    fi
-    
-    # 3. 移除守护进程
-    _disable_argo_watchdog
-
-    # 4. 删除 cloudflared 和相关文件及服务
-    _info "正在清理 cloudflared 文件及服务..."
-    
-    if command -v systemctl &>/dev/null; then
-        systemctl stop cloudflared >/dev/null 2>&1
-        systemctl disable cloudflared >/dev/null 2>&1
-    fi
-    
-    _stop_all_argo_tunnels 2>/dev/null
-    
-    # 删除所有 PID/LOG 文件；旧 /tmp PID 已由 _stop_all_argo_tunnels 校验后处理。
-    rm -f "$RUNTIME_DIR"/argo-*.pid /var/log/singbox_argo_*.log
-    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
-    rm -rf "/etc/cloudflared"
-    
-    # 4. 重启 sing-box
-    _manage_service "restart"
-    
-    _success "Argo 服务已完全卸载！"
-    _success "已释放 cloudflared 占用的空间。"
-}
-
-_view_argo_logs() {
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
-        _warning "当前没有任何 Argo 隧道节点。"
-        return
-    fi
-
-    _info "--- 选择要查看日志的 Argo 隧道 ---"
-    local tags=()
-    mapfile -t tags < <(jq -r 'keys[]' "$ARGO_METADATA_FILE")
-    local i=1
-    local tag_list=()
-    local tag name port
-    for tag in "${tags[@]}"; do
-        name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE")
-        port=$(jq -r --arg tag "$tag" '.[$tag].local_port // empty' "$ARGO_METADATA_FILE")
-        echo "  ${i}) ${name} (端口: ${port})"
-        tag_list[$i]=$tag
-        ((i++))
-    done
-    echo "  0) 返回上级菜单"
-    read -p "请输入选项: " log_choice
-    [[ "$log_choice" == "0" || -z "$log_choice" ]] && return
-
-    local selected_tag=${tag_list[$log_choice]}
-    if [ -n "$selected_tag" ]; then
-        port=$(jq -r --arg tag "$selected_tag" '.[$tag].local_port // empty' "$ARGO_METADATA_FILE")
-        local log_file
-        log_file=$(_argo_log_file "$port")
-        if [ -f "$log_file" ]; then
-            _info "正在查看隧道日志 [${selected_tag}]，按 Ctrl+C 退出。"
-            tail -f "$log_file"
-        else
-            _error "日志文件不存在: ${log_file}"
-        fi
-    else
-        _error "无效选项"
-    fi
-}
 
 _sync_argo_early_data() {
     local config_updated=false
@@ -3079,26 +2109,10 @@ _sync_argo_early_data() {
     fi
 
     if [ -s "$ARGO_METADATA_FILE" ]; then
-        local entry tag protocol name domain uuid password path share_link expected_path
-        while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            tag=$(jq -r '.key // empty' <<< "$entry")
-            protocol=$(jq -r '.value.protocol // "vless-ws"' <<< "$entry")
-            name=$(jq -r '.value.name // ""' <<< "$entry")
-            domain=$(jq -r '.value.domain // ""' <<< "$entry")
-            uuid=$(jq -r '.value.uuid // ""' <<< "$entry")
-            password=$(jq -r '.value.password // ""' <<< "$entry")
-            path=$(jq -r '.value.path // "/"' <<< "$entry")
-            share_link=$(jq -r '.value.share_link // ""' <<< "$entry")
+        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link; do
             [ -z "$tag" ] && continue
-            [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
+            [[ "$protocol" != "vless-ws" && "$protocol" != "vless-ws-enc" && "$protocol" != "trojan-ws" ]] && continue
             [[ -z "$domain" || "$domain" == "null" ]] && continue
-            # 旧同步逻辑写坏的是 share_link，元数据 path 通常仍是原始 WS 路径。
-            # 遇到异常 path 时不要再次生成嵌套链接。
-            if [[ "$path" == *"://"* ]]; then
-                _warn "Argo 节点 ${tag} 的路径异常，已跳过链接同步。"
-                continue
-            fi
 
             if [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] && [ -n "$name" ] && [ "$name" != "null" ]; then
                 export PROXY_NAME="$name"
@@ -3109,20 +2123,16 @@ _sync_argo_early_data() {
                 fi
             fi
 
-            # 比较真实 WS 路径，而非仅查 ed 字样：坏链接也可能包含 ed。
-            expected_path=$(_url_encode "$(_ws_path_with_early_data "$path")")
-            if [[ "$share_link" == *"@${domain}:443?"* && "$share_link" == *"&path=${expected_path}&"* ]]; then
+            if [[ "$share_link" == *"ed%3D${WS_EARLY_DATA_SIZE}"* || "$share_link" == *"ed=${WS_EARLY_DATA_SIZE}"* ]]; then
                 continue
             fi
 
-            if [[ "$protocol" == "vless-ws" && -n "$uuid" && "$uuid" != "null" ]]; then
-                _show_node_link "vless-ws" "$name" "$domain" "443" "$tag" "$uuid" "$path" >/dev/null
-                links_updated=true
-            elif [[ "$protocol" == "trojan-ws" && -n "$password" && "$password" != "null" ]]; then
-                _show_node_link "trojan-ws" "$name" "$domain" "443" "$tag" "$password" "$path" >/dev/null
+            if [[ "$protocol" == "vless-ws-enc" && -n "$uuid" && "$uuid" != "null" ]]; then
+                local _enc=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$ARGO_METADATA_FILE")
+                _show_node_link "vless-ws-enc-argo" "$name" "$domain" "443" "$tag" "$uuid" "$path" "$_enc" >/dev/null
                 links_updated=true
             fi
-        done < <(jq -c 'to_entries[]' "$ARGO_METADATA_FILE" 2>/dev/null)
+        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
     fi
 
     if [ "$config_updated" = true ]; then
@@ -3133,59 +2143,14 @@ _sync_argo_early_data() {
     fi
 }
 
-_argo_menu() {
-    _sync_argo_early_data
-    while true; do
-        clear
-        echo -e "${CYAN}"
-        echo '  ╔═══════════════════════════════════════╗'
-        echo '  ║           Argo 隧道节点管理           ║'
-        echo '  ╚═══════════════════════════════════════╝'
-        echo -e "${NC}"
-        
-        echo -e "  ${CYAN}【创建节点】${NC}"
-        echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
-        echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
-        echo ""
-        
-        echo -e "  ${CYAN}【节点管理】${NC}"
-        echo -e "    ${GREEN}[3]${NC} 查看 Argo 节点信息"
-        echo -e "    ${GREEN}[4]${NC} 查看 Argo 隧道日志"
-        echo -e "    ${GREEN}[5]${NC} 删除 Argo 节点"
-        echo ""
-        
-        echo -e "  ${CYAN}【隧道控制】${NC}"
-        echo -e "    ${RED}[6]${NC} 卸载 Argo 服务"
-        echo -e "    ${GREEN}[7]${NC} 重启 Argo 隧道"
-        echo ""
-        
-        echo -e "  ─────────────────────────────────────────"
-        echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
-        echo ""
-        
-        read -p "  请输入选项 [0-7]: " choice
-
-        case $choice in
-            1) _add_argo_vless_ws ;;
-            2) _add_argo_trojan_ws ;;
-            3) _view_argo_nodes ;;
-            4) _view_argo_logs ;;
-            5) _delete_argo_node ;;
-            6) _uninstall_argo ;;
-            7) _restart_argo_tunnel_menu ;;
-            0) break ;;
-            *) _error "无效选项" ;;
-        esac
-        echo ""
-        read -n 1 -s -r -p "按任意键继续..."
-    done
-}
 
 # --- 服务与配置管理 ---
 
 _create_systemd_service() {
     local mem_limit_mb=$(_get_mem_limit)
-    
+    local gogc_line=""
+    [ -n "$(_get_gogc)" ] && gogc_line="Environment=GOGC=$(_get_gogc)"
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
@@ -3194,6 +2159,7 @@ After=network.target nss-lookup.target
 
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
+${gogc_line}
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -3208,12 +2174,15 @@ _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
     local mem_limit_mb=$(_get_mem_limit)
-    
+    local gogc_line=""
+    [ -n "$(_get_gogc)" ] && gogc_line="export GOGC=$(_get_gogc)"
+
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
 
 description="sing-box service"
 export GOMEMLIMIT="${mem_limit_mb}MiB"
+${gogc_line}
 command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
@@ -3222,8 +2191,7 @@ respawn_delay=3
 respawn_max=0
 
 pidfile="${PID_FILE}"
-# supervise-daemon 自动将 stdout/stderr 重定向功能需要 openrc 版本支持
-# 如果不支持，日志可能不会输出到文件，但服务能正常运行
+# supervise-daemon 自动重定向 stdout/stderr 需 openrc 版本支持, 否则日志不落文件但服务正常。
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
 
@@ -3240,7 +2208,7 @@ EOF
 }
 
 _create_service_files() {
-    
+
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         _create_systemd_service
@@ -3272,7 +2240,7 @@ _cleanup_runtime_logs() {
     [ $((now - last)) -lt 172800 ] && return 0
 
     local log
-    for log in "$LOG_FILE" "$ARGO_LOG_FILE" /var/log/xray.log /var/log/singbox_argo_*.log; do
+    for log in "$LOG_FILE" /var/log/xray.log; do
         [ -f "$log" ] && : > "$log"
     done
     printf '%s\n' "$now" > "$state_file"
@@ -3344,29 +2312,22 @@ _uninstall() {
     _warning "！！！警告！！！"
     _warning "本操作将停止并禁用 [主脚本] 服务 (sing-box)，"
     _warning "删除所有相关文件 (包括二进制、组件脚本、别名及配置文件)。"
-    
+
     echo ""
     echo "即将删除以下内容："
     echo -e "  ${RED}-${NC} 主配置与脚本目录: ${SINGBOX_DIR}"
     echo -e "  ${RED}-${NC} sing-box 二进制: ${SINGBOX_BIN}"
     echo -e "  ${RED}-${NC} yq 二进制: ${YQ_BINARY}"
-    [ -f "${CLOUDFLARED_BIN}" ] && echo -e "  ${RED}-${NC} cloudflared 二进制: ${CLOUDFLARED_BIN}"
+    echo -e "  ${RED}-${NC} wgcf 二进制: ${WGCF_BIN}"
     [ -f "/usr/local/bin/xray" ] && echo -e "  ${RED}-${NC} Xray 核心及配置: /usr/local/etc/xray/"
     echo -e "  ${RED}-${NC} 系统别名: /usr/local/bin/sb"
     echo -e "  ${RED}-${NC} 管理脚本: ${SELF_SCRIPT_PATH}"
     echo ""
-    
-    read -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
+
+    read -r -p "$(echo -e ${YELLOW}"确定要执行卸载吗? (y/N): "${NC})" confirm_main
     [[ "$confirm_main" != "y" && "$confirm_main" != "Y" ]] && _info "卸载已取消。" && return
 
-    if [ "$INIT_SYSTEM" = direct ]; then
-        _with_state_lock _direct_xray_pid stop "$XRAY_PID_FILE" /usr/local/bin/xray /usr/local/etc/xray/config.json || return 1
-    fi
-
-    # 1. Argo 必须在删除元数据前停止，否则会失去受控 PID 到端口的映射，
-    # 留下仍在运行的 cloudflared 进程。
-    _disable_argo_watchdog 2>/dev/null || true
-    _stop_all_argo_tunnels 2>/dev/null || true
+    _disable_memwatch 2>/dev/null || true
 
     # 2. 停止主服务，并清理服务定义与定时重启组件。
     _manage_service "stop" >/dev/null 2>&1 || true
@@ -3395,10 +2356,6 @@ _uninstall() {
     fi
     _remove_nftables_rules
 
-    rm -f "${CLOUDFLARED_BIN}" "$RUNTIME_DIR"/argo-*.pid "$RUNTIME_DIR"/argo-keepalive.lock
-    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${ARGO_LOG_FILE}" /var/log/singbox_argo_*.log
-    rm -rf /etc/cloudflared
 
     # 4. 即使核心文件已部分丢失，也清理残留的 Xray 服务与状态。
     if [ -f "/usr/local/bin/xray" ] || [ -d "/usr/local/etc/xray" ] \
@@ -3426,9 +2383,10 @@ _uninstall() {
     rm -f "${SINGBOX_DIR}/parser.sh" "${SINGBOX_DIR}/advanced_relay.sh" "${SINGBOX_DIR}/xray_manager.sh"
     rm -f "${SCRIPT_DIR}/parser.sh" "${SCRIPT_DIR}/advanced_relay.sh" "${SCRIPT_DIR}/xray_manager.sh"
     rm -f "/usr/local/bin/sb"
-    
+
     # 6. 处理主程序 (考虑与线路机共用)
     local relay_script="/root/relay-install.sh"
+    rm -f "${WGCF_BIN}"
     if [ -f "$relay_script" ]; then
         _warn "检测到 [线路机] 脚本存在，为保持其运行，将 [保留] sing-box 主程序。"
     else
@@ -3487,9 +2445,8 @@ _initialize_config_files() {
 EOF
     fi
     [ -s "$METADATA_FILE" ] || echo "{}" > "$METADATA_FILE"
-    
-    # [关键修复] 初始化 relay.json - 服务启动命令会加载这个文件
-    # 必须确保在服务运行前此文件物理存在，否则 sing-box 会 Fatal 退出
+
+    # relay.json 须在服务启动前物理存在, 否则 sing-box 会 Fatal 退出。
     local RELAY_JSON="${SINGBOX_DIR}/relay.json"
     if [ ! -s "$RELAY_JSON" ]; then
         echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_JSON"
@@ -3585,53 +2542,11 @@ _init_relay_config() {
     fi
 }
 
-_cleanup_legacy_config() {
-    # 检查并清理 config.json 中残留的旧版中转配置 (tag 以 relay-out- 开头的 outbound)
-    # 这些残留会导致路由冲突，使主脚本节点误走中转线路
-    local needs_restart=false
-    
-    if jq -e '.outbounds[] | select(.tag | startswith("relay-out-"))' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _warn "检测到旧版中转残留配置，正在清理..."
-        if ! cp -p "$CONFIG_FILE" "${CONFIG_FILE}.bak_legacy"; then
-            _error "无法创建旧版中转配置清理快照，已取消清理。"
-            return 1
-        fi
-        chmod 600 "${CONFIG_FILE}.bak_legacy" 2>/dev/null || true
-        _atomic_modify_json "$CONFIG_FILE" '
-            .outbounds = ((.outbounds // []) | map(select(((.tag // "") | startswith("relay-out-")) | not)))
-            | .route = (.route // {"rules":[]})
-            | .route.rules = ((.route.rules // []) | map(select(((.outbound // "") | startswith("relay-out-")) | not)))
-            | if any(.outbounds[]?; .tag == "direct") then . else .outbounds = [{"type":"direct","tag":"direct"}] + .outbounds end
-        ' || return 1
-        
-        _success "配置清理完成。相关中转已被迁移至独立配置文件 (relay.json)。"
-        needs_restart=true
-    fi
-    
-    # [关键修复] 确保 route.final 设置为 "direct"
-    # 这是核心修复：当 config.json 和 relay.json 合并时，relay-out-* outbound 会被插入到 outbounds 列表前面
-    # 如果没有 route.final，sing-box 会使用列表中的第一个 outbound 作为默认出口，导致主节点流量走中转
-    if ! jq -e '.route.final == "direct"' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _warn "检测到 route.final 未设置或不正确，正在修复..."
-        
-        _atomic_modify_json "$CONFIG_FILE" 'if .route then .route.final = "direct" else .route = {"rules":[],"final":"direct"} end' || return 1
-        
-        _success "route.final 已设置为 direct，主节点流量将走本机 IP。"
-        needs_restart=true
-    fi
-    
-    if [ "$needs_restart" = true ]; then
-        return 0
-    fi
-    return 1
-}
 
 _check_and_fix_dns() {
-    # 热修复：1.补充缺失的 DNS 模块，2.将容易引起出站路由绑定死循环（连接被秒重置）的 auto_detect_interface 清除
-    # 3. 为未设置策略的旧配置补充 prefer_ipv4，4.让 local DNS 避开 Linux 上可能阻塞的 systemd-resolved D-Bus 路径
-    # 保留用户在 DNS 菜单中明确选择的地址和解析策略。
+    # 清掉会引起出站路由死循环的 auto_detect_interface, local DNS 避开 systemd-resolved D-Bus。
     if [ ! -f "$CONFIG_FILE" ]; then return; fi
-    
+
     local has_dns legacy_dns has_auto_detect dns_strategy has_default_resolver local_dns_needs_prefer_go
     has_dns=$(jq 'has("dns")' "$CONFIG_FILE" 2>/dev/null)
     legacy_dns=$(jq 'any(.dns.servers[]?; has("address") or ((.type // "") == "")) or any(.dns.rules[]?; has("outbound"))' "$CONFIG_FILE" 2>/dev/null)
@@ -3640,10 +2555,10 @@ _check_and_fix_dns() {
     has_default_resolver=$(jq '(.route.default_domain_resolver // null) != null' "$CONFIG_FILE" 2>/dev/null)
     local_dns_needs_prefer_go=$(jq 'any(.dns.servers[]?; ((.type // "") == "local") and ((.prefer_go // false) != true))' "$CONFIG_FILE" 2>/dev/null)
     local needs_restart=false
-    
+
     if [ "$has_dns" == "false" ] || [ "$legacy_dns" == "true" ] || [ "$has_auto_detect" == "true" ] || [ -z "$dns_strategy" ] || [ "$has_default_resolver" != "true" ] || [ "$local_dns_needs_prefer_go" == "true" ]; then
         _warn "检测到 DNS/路由配置需要兼容性修复，正在自动处理..."
-        
+
         local backup_file
         backup_file=$(mktemp "${CONFIG_FILE}.dnsfix.backup.XXXXXX") || return 1
         cp -p "$CONFIG_FILE" "$backup_file" || { rm -f "$backup_file"; return 1; }
@@ -3694,7 +2609,7 @@ _check_and_fix_dns() {
             fi
         fi
     fi
-    
+
     if [ "$needs_restart" == "true" ]; then
         return 0
     fi
@@ -3707,7 +2622,7 @@ _generate_self_signed_cert() {
     local key_path="$3"
 
     _info "正在为 ${domain} 生成支持 SAN 的高级自签名证书..."
-    
+
     # 创建临时配置文件用于生成 SAN
     local openssl_config=$(mktemp)
     cat > "$openssl_config" <<EOF
@@ -3730,7 +2645,7 @@ EOF
     openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
         -keyout "$key_path" -out "$cert_path" \
         -config "$openssl_config" >/dev/null 2>&1
-    
+
     local status=$?
     rm -f "$openssl_config"
 
@@ -3743,10 +2658,7 @@ EOF
     return 0
 }
 
-# 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
-# 均在上方统一定义，此处不再重复定义以避免不一致
 
-# 显示节点分享链接（在添加节点后调用）
 # 参数: $1=协议类型, $2=节点名称, $3=服务器IP(用于链接), $4=端口, $5=节点TAG, 其他参数根据协议不同
 _show_node_link() {
     local type="$1"
@@ -3763,9 +2675,9 @@ _show_node_link() {
     fi
 
     shift 5
-    
+
     local url=""
-    
+
     case "$type" in
         "vless-reality")
             # 参数: uuid, sni, public_key, short_id, flow
@@ -3773,31 +2685,39 @@ _show_node_link() {
             # 对 SNI 执行终极保底与净化
             local sni=$(echo "$2" | xargs)
             [[ -z "$sni" ]] && sni="$DEFAULT_SNI"
-            
+
             url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=chrome&type=tcp&flow=${flow}&sni=${sni}&sid=${sid}#$(_url_encode "$name")"
             ;;
-        "vless-ws-tls")
-            # 参数: uuid, sni, ws_path, skip_verify
-            local uuid="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+        "vless-enc-tcp")
+            # 参数: uuid, enc_key, flow
+            local uuid="$1" enc_key="$2" flow="${3:-xtls-rprx-vision}"
+            url="vless://${uuid}@${link_ip}:${port}?encryption=${enc_key}&flow=${flow}&type=tcp#$(_url_encode "$name")"
             ;;
-        "vless-grpc-tls")
-            # 参数: uuid, sni, service_name, skip_verify, cert_path
-            local uuid="$1" sni="${2:-$DEFAULT_SNI}" service_name="$3" skip_verify="$4" cert_path="$5"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=grpc&serviceName=$(_url_encode "$service_name")&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+        "vless-xhttp-reality-enc")
+            # 参数: uuid, sni, public_key, short_id, xhttp_path, enc_key
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" pk="$3" sid="$4" xhttp_path="$5" enc_key="$6"
+            url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&pbk=$(_url_encode "${pk}")&fp=chrome&sni=${sni}&sid=${sid}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000#$(_url_encode "$name")"
             ;;
-        "vless-tcp")
-            # 参数: uuid
-            local uuid="$1"
-            url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$name")"
+        "vless-xhttp-enc-tls")
+            # 参数: uuid, sni, xhttp_path, skip_verify, cert_path, enc_key
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" xhttp_path="$3" skip_verify="$4" cert_path="$5" enc_key="$6"
+            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sni}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${sni}&ech=${CDN_ECH}#$(_url_encode "$name")"
             ;;
-        "trojan-ws-tls")
-            # 参数: password, sni, ws_path, skip_verify
-            local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
-            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
-            url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+        "vless-xhttp-enc")
+            # 参数: uuid, host, xhttp_path, enc_key
+            local uuid="$1" host="${2:-$DEFAULT_SNI}" xhttp_path="$3" enc_key="$4"
+            url="vless://${uuid}@${link_ip}:443?security=tls&alpn=h2&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&host=${host}&sni=${host}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000#$(_url_encode "$name")"
+            ;;
+        "vless-xhttp-argo")
+            # Argo 专用: uuid, path, enc_key
+            local uuid="$1" xhttp_path="$2" enc_key="$3"
+            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&alpn=h2&type=xhttp&mode=stream-one&host=${link_ip}&path=$(_url_encode "$xhttp_path")&x_padding_bytes=100-1000&sni=${link_ip}&ech=${CDN_ECH}#$(_url_encode "$name")"
+            ;;
+        "vless-ws-enc-argo")
+            # Argo 专用: uuid, path, enc_key
+            local uuid="$1" ws_path="$2" enc_key="$3"
+            local ed_path=$(_ws_path_with_early_data "$ws_path")
+            url="vless://${uuid}@${link_ip}:443?encryption=${enc_key}&flow=xtls-rprx-vision&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}&ech=${CDN_ECH}#$(_url_encode "$name")"
             ;;
         "hysteria2")
             # 参数: password, sni, obfs_password(可选), port_hopping(可选)
@@ -3808,30 +2728,17 @@ _show_node_link() {
             local pin_param=""
             local cert_pcs=$(_cert_sha256_hex "$cert_path")
             [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
+            url="hysteria2://$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
             # 参数: uuid, password, sni
             local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
-            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
-            ;;
-        "anytls")
-            # v2rayN 使用 sing-box 运行 AnyTLS；其 sing-box 出站不会应用链接中的 pcs。
-            # 自签证书必须显式传递 insecure=1，与 clash.yaml 的 skip-cert-verify 一致。
-            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3"
-            local insecure_param=""
-            [ "$skip_verify" = "true" ] && insecure_param="&insecure=1"
-            url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}&type=tcp#$(_url_encode "$name")"
-            ;;
-        "any-reality")
-            # 参数: password, sni, public_key, short_id
-            local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
-            url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+            url="tuic://${uuid}:$(_url_encode "$password")@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
             ;;
         "shadowsocks")
             # 参数: method, password
             local method="$1" password="$2"
-            local userinfo=$(printf '%s' "${method}:${password}" | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+            local userinfo=$(_ss_base64_encode "${method}:${password}")
             url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$name")"
             ;;
         "shadowsocks-shadowtls")
@@ -3855,30 +2762,12 @@ _show_node_link() {
             echo -e "${CYAN}您也可以直接打开本机位于 ${YELLOW}/usr/local/etc/sing-box/clash.yaml${CYAN} 的配置文件，${NC}"
             echo -e "${CYAN}找到对应节点的 YAML 代码块，并复制到您的客户端中使用！${NC}"
             ;;
-        "vless-ws")
-            # Argo 专用: uuid, path
-            local uuid="$1" ws_path="$2"
-            local ed_path=$(_ws_path_with_early_data "$ws_path")
-            url="vless://${uuid}@${link_ip}:443?encryption=none&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
-            ;;
-        "trojan-ws")
-            # Argo 专用: password, path
-            local password="$1" ws_path="$2"
-            local ed_path=$(_ws_path_with_early_data "$ws_path")
-            url="trojan://$(_url_encode "${password}")@${link_ip}:443?security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
-            ;;
-        "socks")
-            # 参数: username, password
-            local username="$1" password="$2"
-            echo ""
-            _info "节点信息: 服务器: ${link_ip}, 端口: ${port}, 用户名: ${username}, 密码: ${password}"
-            ;;
     esac
-    
+
     if [ -n "$url" ]; then
         echo ""
         local clean_url=$(echo "$url" | sed 's/&insecure=1//g' | sed 's/&pcs=[a-fA-F0-9]*//g')
-        if [ "$clean_url" != "$url" ] && [[ "$type" != "anytls" ]] && [[ "$type" != "hysteria2" ]] && [[ "$type" != "tuic" ]] && [[ "$type" != "vless-reality" ]] && [[ "$type" != "any-reality" ]]; then
+        if [ "$clean_url" != "$url" ] && [[ "$type" != "hysteria2" ]] && [[ "$type" != "tuic" ]] && [[ "$type" != "vless-reality" ]] && [[ "$type" != "vless-xhttp-reality-enc" ]]; then
             echo -e "${YELLOW}═══════════════ 🔗 直连分享链接 (含防劫持指纹) ═══════════════${NC}"
             echo -e "${CYAN}${url}${NC}"
             echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"
@@ -3892,7 +2781,7 @@ _show_node_link() {
             echo -e "${CYAN}${url}${NC}"
             echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
         fi
-        
+
         # [持久化] 将生成的链接存入元数据，防止查看时由于动态提取导致的 SNI 丢失
         if [ -n "$tag" ] && [ "$tag" != "null" ]; then
             if [[ "$tag" == argo-* ]]; then
@@ -3911,9 +2800,11 @@ _show_node_link() {
             fi
         fi
     fi
-    # SOCKS5 与 ShadowTLS 没有通用的单行分享链接，但同样保存规范化元数据，
-    # 使“修改节点”不需要从 YAML 或备注名称猜测连接地址和具体变种。
-    if [ -n "$tag" ] && [ "$tag" != "null" ] && [[ "$tag" != argo-* ]]; then
+    if [[ "$type" == "vless-xhttp-argo" || "$type" == "vless-ws-enc-argo" ]] && [ -n "$url" ]; then
+        _sync_argo_domain_to_yaml "$name" "$metadata_ip"
+    fi
+    # SOCKS5 与 ShadowTLS 无通用单行分享链接, 仍存规范化元数据供修改节点用。
+    if [ -n "$tag" ] && [ "$tag" != "null" ] && [[ "$tag" != argo-* ]] && [ -z "$url" ]; then
         _atomic_modify_json "$METADATA_FILE" '
             . + {($tag): ((.[$tag] // {}) + {
                 name:$name,
@@ -3945,322 +2836,175 @@ _show_cdn_guidance() {
     echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════${NC}"
 }
 
-_show_grpc_cdn_guidance() {
-    local domain="$1"
-    local port="$2"
-    echo ""
-    echo -e "${YELLOW}══════════════════ 🔧 VLESS gRPC + Cloudflare 配置提示 ══════════════════${NC}"
-    _info "1. ${CYAN}【CF 后台】${NC}将该域名的解析记录开启小黄云 (${ORANGE}Proxied${NC})。"
-    _info "2. ${CYAN}【CF 后台】${NC}在 [SSL/TLS] 菜单中，将加密模式设为: ${GREEN}Full (完全)${NC}。"
-    _info "3. ${CYAN}【CF 后台】${NC}在 [Network] 菜单中确认 gRPC 已开启。"
-    if [ "$port" != "443" ]; then
-        _warn "4. 您的服务器监听的是 ${port} 端口。请在 [Rules] -> [Origin Rules] 中配置："
-        _warn "   - 主机名 包含 \"${domain}\" -> 重写到端口: ${port}"
-    else
-        _info "4. 您的服务器已监听 443 端口，无需设置 Origin Rules。"
-    fi
-    _info "5. ${CYAN}【客户端】${NC}地址可改为优选域名/IP，端口改为 ${GREEN}443${NC}。"
-    _info "   (注：SNI 必须保持为您的域名 ${domain}，gRPC serviceName 必须保持一致)"
-    echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════${NC}"
-}
 
-
-_add_vless_ws_tls() {
-    local camouflage_domain=""
-    local port=""
-    local client_server_addr="${server_ip}"
-
+_add_vless_xhttp_reality_enc() {
+    # 服务端 transport 不写 mode; 分享链接默认 stream-one, 客户端导入后仍可自行改。
+    local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local server_name="$(_pick_random_default_sni)"
+    local port="" name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
         port="$BATCH_PORT"
-        camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
+        server_name=$(echo "${BATCH_SNI}" | xargs)
+        [[ -z "$server_name" ]] && server_name="$(_pick_random_default_sni)"
+        name="Batch-VLESS-XHTTP-REALITY-ENC-${port}"
+        [ -z "$node_ip" ] && node_ip="$server_ip"
     else
-        _info "--- VLESS (WebSocket+TLS) 设置向导 ---"
-        _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
-        
-        # IPv6 处理
-        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-             client_server_addr="[${client_server_addr}]"
-        fi
-
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
-
+        _info "--- VLESS (XHTTP + Reality + ENC + Vision) 直连设置向导 ---"
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        node_ip=${custom_ip:-$server_ip}
+        read -r -p "请输入伪装域名 (默认: ${server_name}): " camouflage_domain
+        server_name=${camouflage_domain:-"$server_name"}
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            read -r -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
         done
+        local default_name="VLESS-XHTTP-REALITY-ENC-${port}"
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
     fi
-
-    # 客户端连接端口默认与监听端口一致 (直连模式)
-    local client_port="$port"
-
-    # --- 步骤 4: 路径 ---
-    local ws_path=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-    else
-        read -p "请输入 WebSocket 路径 (回车则随机生成): " input_ws_path
-        if [ -z "$input_ws_path" ]; then
-            ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-            _info "已为您生成随机 WebSocket 路径: ${ws_path}"
+    local xhttp_path=""
+    if [ "$BATCH_MODE" != "true" ]; then
+        read -r -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
+        if [ -z "$input_xhttp_path" ]; then
+            xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+            _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
         else
-            ws_path="$input_ws_path"
-            [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
+            xhttp_path="$input_xhttp_path"
+            [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
         fi
-    fi
-
-    # 提前定义 tag，用于证书文件命名
-    local tag="vless-ws-in-${port}"
-    local cert_path=""
-    local key_path=""
-    local skip_verify=false
-
-    # --- 步骤 5: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
     else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
+        xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
     fi
-
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-        _info "  - (或)   使用 Cloudflare 源服务器证书"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-        fi
-    fi
-    
-    # [!] 自定义名称
-    local name=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-VLESS-WS-${port}"
-    else
-        local default_name="VLESS-WS-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-        name=${custom_name:-$default_name}
-    fi
-
     local uuid=$(${SINGBOX_BIN} generate uuid)
-    
-    # Inbound (服务器端) 配置
-    local inbound_json=$(jq -n \
-        --arg t "$tag" \
-        --arg p "$port" \
-        --arg u "$uuid" \
-        --arg cp "$cert_path" \
-        --arg kp "$key_path" \
-        --arg sn "$camouflage_domain" \
-        --arg wsp "$ws_path" \
-        '{
-            "type": "vless",
-            "tag": $t,
-            "listen": "::",
-            "listen_port": ($p|tonumber),
-            "users": [{"uuid": $u, "flow": ""}],
-            "tls": {
-                "enabled": true,
-                "server_name": $sn,
-                "certificate_path": $cp,
-                "key_path": $kp
-            },
-            "transport": {
-                "type": "ws",
-                "path": $wsp
-            }
-        }')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-
-    # Proxy (客户端) 配置
-    local proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$client_server_addr" \
-            --arg p "$client_port" \
-            --arg u "$uuid" \
-            --arg sn "$camouflage_domain" \
-            --arg wsp "$ws_path" \
-            --arg skip_verify_bool "$skip_verify" \
-            --arg host_header "$camouflage_domain" \
-            '{
-                "name": $n,
-                "type": "vless",
-                "server": $s,
-                "port": ($p|tonumber),
-                "uuid": $u,
-                "encryption": "none",
-                "tls": true,
-                "udp": true,
-                "skip-cert-verify": ($skip_verify_bool == "true"),
-                "network": "ws",
-                "sni": $sn,
-                "ws-opts": {
-                    "path": $wsp,
-                    "headers": {
-                        "Host": $host_header
-                    }
-                }
-            }')
-            
+    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
+    local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+    local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+    [ -n "$private_key" ] && [ -n "$public_key" ] || { _error "Reality 密钥生成失败！"; return 1; }
+    local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+    local tag="vless-xhttp-reality-in-${port}"
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" --arg dec "$server_decryption" --arg xp "$xhttp_path" \
+        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"decryption":$dec,"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}},"transport":{"type":"xhttp","path":$xp,"x_padding_bytes":"100-1000"}}')
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" --arg enc "$client_encryption" --arg xp "$xhttp_path" \
+        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"xhttp","flow":"xtls-rprx-vision","encryption":$enc,"servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid},"xhttp-opts":{"path":$xp,"headers":{"Host":$sn}}}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _success "VLESS (WebSocket+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
-    
-    # CDN 指引 (仅在非批量模式下详细显示)
-    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
-
-    # IPv6 处理用于链接
-    local link_ip="$client_server_addr"
-    _show_node_link "vless-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path" || return 1
+    local meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" --arg enc "$client_encryption" --arg dec "$server_decryption" --arg pk "$public_key" --arg sk "$private_key" --arg sid "$short_id" \
+        '{name:$n, server_name:$sn, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, shortId:$sid, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" '. + {($tag): $meta}' --arg tag "$tag" --argjson meta "$meta_json" || return 1
+    _success "VLESS (XHTTP + Reality + ENC + Vision) 直连节点 [${name}] 添加成功!"
+    _info "分享链接默认 mode=stream-one; 服务端未限定 mode, 客户端导入后仍可自行改成 packet-up / stream-up。"
+    _show_node_link "vless-xhttp-reality-enc" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id" "$xhttp_path" "$client_encryption" || return 1
 }
 
-_add_vless_grpc_tls() {
+_add_vless_xhttp_enc_tls() {
+    # 客户端只认 CF 443 证书, skip-cert-verify 恒为 false; 服务端无 mode, 链接默认 stream-one。
     local camouflage_domain=""
     local port=""
-    local client_server_addr="${server_ip}"
-
-    if [ "$BATCH_MODE" = "true" ]; then
-        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
-        port="$BATCH_PORT"
-        camouflage_domain="${BATCH_GRPC_TLS_DOMAIN:-$BATCH_SNI}"
+    local client_server_addr=""
+    _info "--- VLESS (XHTTP + TLS + ENC + Vision) 过 CDN 设置向导 ---"
+    _info "本协议仅用于 Cloudflare CDN: 客户端 -> CF (443/TLS/ECH) -> 源站 (Full/Full Strict)。"
+    read -r -p "请输入 CF 绑定域名 (客户端 SNI/Host, 例如: vless.example.com): " camouflage_domain
+    [[ -z "$camouflage_domain" ]] && _error "域名不能为空" && return 1
+    [[ "$camouflage_domain" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
+    _info "请输入客户端连接地址:"
+    _info "  - 直接回车默认使用域名: ${camouflage_domain}"
+    _info "  - 也可以输入已有的 Cloudflare 优选 IP / 优选域名 (SNI/Host 仍保持为上述域名)"
+    read -r -p "请输入连接地址 (默认: ${camouflage_domain}): " connection_address
+    client_server_addr=${connection_address:-$camouflage_domain}
+    client_server_addr=$(_normalize_client_server "$client_server_addr")
+    local yaml_ip="$client_server_addr"
+    local link_ip="$client_server_addr"; [[ "$client_server_addr" == *":"* ]] && link_ip="[$client_server_addr]"
+    while true; do
+        read -r -p "请输入源站监听端口 (CF Full 回源首推 443; 非 443 需在 CF Origin Rules 重写到该端口): " port
+        [[ -z "$port" ]] && _error "端口不能为空" && continue
+        _check_port_conflict "$port" "tcp" && continue
+        break
+    done
+    local xhttp_path=""
+    read -r -p "请输入 XHTTP 路径 (回车则随机生成): " input_xhttp_path
+    if [ -z "$input_xhttp_path" ]; then
+        xhttp_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
+        _info "已为您生成随机 XHTTP 路径: ${xhttp_path}"
     else
-        _info "--- VLESS (gRPC+TLS) 设置向导 ---"
-        _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
-
-        # IPv6 处理
-        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-             client_server_addr="[${client_server_addr}]"
-        fi
-
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
-
-        while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
-            break
-        done
+        xhttp_path="$input_xhttp_path"
+        [[ ! "$xhttp_path" == /* ]] && xhttp_path="/${xhttp_path}"
     fi
-
-    local client_port="$port"
-
-    local generated_service_name="grpc-$(${SINGBOX_BIN} generate rand --hex 4)"
-    local service_name=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        service_name="${BATCH_GRPC_SERVICE_NAME:-$generated_service_name}"
-    else
-        read -p "请输入 gRPC serviceName (回车则随机生成: ${generated_service_name}): " input_service_name
-        service_name=${input_service_name:-$generated_service_name}
-        service_name=$(echo "$service_name" | xargs)
-        [[ -z "$service_name" ]] && _error "gRPC serviceName 不能为空" && return 1
-        _info "gRPC serviceName: ${service_name}"
-    fi
-
-    local tag="vless-grpc-in-${port}"
+    local tag="vless-xhttp-in-${port}"
     local cert_path=""
     local key_path=""
-    local skip_verify=false
-
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-
+    echo ""
+    echo "请选择源站证书类型 (仅影响 CF -> 源站, 不影响客户端):"
+    echo "  1) 自动生成自签名证书 (CF SSL 用 Full 模式即可接受)"
+    echo "  2) 手动上传证书文件 (acme.sh 签发 / Cloudflare 源证书等, 可用 Full Strict)"
+    read -r -p "请选择 [1-2] (默认: 1): " cert_choice
+    cert_choice=${cert_choice:-1}
     if [ "$cert_choice" == "1" ]; then
         cert_path="${SINGBOX_DIR}/${tag}.pem"
         key_path="${SINGBOX_DIR}/${tag}.key"
         _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-        _info "已生成自签名证书，客户端将跳过证书验证。"
+        _info "已生成自签名源站证书, CF SSL 请用 Full (不要用 Flexible, 否则 CF 以明文回源会握手失败)。"
     else
         _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-        _info "  - (或)   使用 Cloudflare 源服务器证书"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
+        read -r -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
         [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
+        read -r -p "请输入私钥文件 .key 的完整路径: " key_path
         [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-
-        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
+    fi
+    local default_name="VLESS-XHTTP-ENC-CDN-${port}"
+    read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
+    local name=${custom_name:-$default_name}
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+    local keypair private_key="" public_key=""
+    if [ -x "${SINGBOX_BIN}" ]; then
+        keypair=$(${SINGBOX_BIN} generate reality-keypair 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
         fi
     fi
-
-    local name=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-VLESS-gRPC-${port}"
-    else
-        local default_name="VLESS-gRPC-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-        name=${custom_name:-$default_name}
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "VLESS ENC X25519 密钥生成失败！"
+        return 1
     fi
-
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
     local inbound_json=$(jq -n \
         --arg t "$tag" \
         --arg p "$port" \
         --arg u "$uuid" \
+        --arg dec "$server_decryption" \
         --arg cp "$cert_path" \
         --arg kp "$key_path" \
         --arg sn "$camouflage_domain" \
-        --arg svc "$service_name" \
+        --arg xp "$xhttp_path" \
         '{
             "type": "vless",
             "tag": $t,
             "listen": "::",
             "listen_port": ($p|tonumber),
-            "users": [{"uuid": $u, "flow": ""}],
+            "users": [{"uuid": $u, "flow": "xtls-rprx-vision"}],
+            "decryption": $dec,
             "tls": {
                 "enabled": true,
                 "server_name": $sn,
@@ -4269,537 +3013,66 @@ _add_vless_grpc_tls() {
                 "key_path": $kp
             },
             "transport": {
-                "type": "grpc",
-                "service_name": $svc
+                "type": "xhttp",
+                "path": $xp,
+                "x_padding_bytes": "100-1000"
             }
         }')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
     local proxy_json=$(jq -n \
             --arg n "$name" \
-            --arg s "$client_server_addr" \
-            --arg p "$client_port" \
+            --arg s "$yaml_ip" \
             --arg u "$uuid" \
+            --arg enc "$client_encryption" \
             --arg sn "$camouflage_domain" \
-            --arg svc "$service_name" \
-            --arg skip_verify_bool "$skip_verify" \
+            --arg xp "$xhttp_path" \
             '{
                 "name": $n,
                 "type": "vless",
                 "server": $s,
-                "port": ($p|tonumber),
+                "port": 443,
                 "uuid": $u,
-                "encryption": "none",
+                "flow": "xtls-rprx-vision",
+                "encryption": $enc,
                 "tls": true,
                 "udp": true,
-                "skip-cert-verify": ($skip_verify_bool == "true"),
-                "network": "grpc",
+                "skip-cert-verify": false,
                 "servername": $sn,
-                "grpc-opts": {
-                    "grpc-service-name": $svc
-                }
-            }')
-
-    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _success "VLESS (gRPC+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni): ${camouflage_domain}"
-    _success "gRPC serviceName: ${service_name}"
-
-    [ "$BATCH_MODE" != "true" ] && _show_grpc_cdn_guidance "${camouflage_domain}" "${port}"
-
-    local link_ip="$client_server_addr"
-    _show_node_link "vless-grpc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$service_name" "$skip_verify" "$cert_path" || return 1
-}
-
-_add_trojan_ws_tls() {
-    local camouflage_domain=""
-    local port=""
-    local client_server_addr="${server_ip}"
-
-    if [ "$BATCH_MODE" = "true" ]; then
-        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
-        port="$BATCH_PORT"
-        camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
-    else
-        _info "--- Trojan (WebSocket+TLS) 设置向导 ---"
-        _info "请输入客户端用于“连接”的地址:"
-        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
-        _info "  - (其他) 您也可以手动输入一个IP或域名"
-        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
-        client_server_addr=${connection_address:-$server_ip}
-        
-        # IPv6 处理
-        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
-             client_server_addr="[${client_server_addr}]"
-        fi
-
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
-
-        while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
-            break
-        done
-    fi
-
-    # 客户端连接端口默认与监听端口一致 (直连模式)
-    local client_port="$port"
-
-    # --- 步骤 4: 路径 ---
-    local ws_path=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-    else
-        read -p "请输入 WebSocket 路径 (回车则随机生成): " input_ws_path
-        if [ -z "$input_ws_path" ]; then
-            ws_path="/"$(${SINGBOX_BIN} generate rand --hex 8)
-            _info "已为您生成随机 WebSocket 路径: ${ws_path}"
-        else
-            ws_path="$input_ws_path"
-            [[ ! "$ws_path" == /* ]] && ws_path="/${ws_path}"
-        fi
-    fi
-
-    # 提前定义 tag，用于证书文件命名
-    local tag="trojan-ws-in-${port}"
-    local cert_path=""
-    local key_path=""
-    local skip_verify=false
-
-    # --- 步骤 5: 证书选择 ---
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-        if [ "$cert_choice" == "1" ]; then
-            cert_path="${SINGBOX_DIR}/${tag}.pem"
-            key_path="${SINGBOX_DIR}/${tag}.key"
-            _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-            skip_verify=true
-            _info "已生成自签名证书，客户端将跳过证书验证。"
-        else
-            # 手动上传证书
-            _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-            _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-            _info "  - (或)   使用 Cloudflare 源服务器证书"
-            read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-            [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-            read -p "请输入私钥文件 .key 的完整路径: " key_path
-            [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-            
-            # 询问是否跳过验证
-            read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-            if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-                skip_verify=true
-                _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-            fi
-        fi
-    fi
-
-    # [!] Trojan: 使用密码
-    local password=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
-    else
-        read -p "请输入 Trojan 密码 (回车则随机生成): " input_pw
-        if [ -z "$input_pw" ]; then
-            password=$(${SINGBOX_BIN} generate rand --hex 16)
-            _info "已为您生成随机密码: ${password}"
-        else
-            password="$input_pw"
-        fi
-    fi
-
-    # [!] 自定义名称
-    local name=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-Trojan-WS-${port}"
-    else
-        local default_name="Trojan-WS-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
-        name=${custom_name:-$default_name}
-    fi
-
-    # Inbound (服务器端) 配置
-    local inbound_json=$(jq -n \
-        --arg t "$tag" \
-        --arg p "$port" \
-        --arg pw "$password" \
-        --arg cp "$cert_path" \
-        --arg kp "$key_path" \
-        --arg sn "$camouflage_domain" \
-        --arg wsp "$ws_path" \
-        '{
-            "type": "trojan",
-            "tag": $t,
-            "listen": "::",
-            "listen_port": ($p|tonumber),
-            "users": [{"password": $pw}],
-            "tls": {
-                "enabled": true,
-                "server_name": $sn,
-                "certificate_path": $cp,
-                "key_path": $kp
-            },
-            "transport": {
-                "type": "ws",
-                "path": $wsp
-            }
-        }')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-
-    # Proxy (客户端) 配置
-    local proxy_json=$(jq -n \
-            --arg n "$name" \
-            --arg s "$client_server_addr" \
-            --arg p "$client_port" \
-            --arg pw "$password" \
-            --arg sn "$camouflage_domain" \
-            --arg wsp "$ws_path" \
-            --arg skip_verify_bool "$skip_verify" \
-            --arg host_header "$camouflage_domain" \
-            '{
-                "name": $n,
-                "type": "trojan",
-                "server": $s,
-                "port": ($p|tonumber),
-                "password": $pw,
-                "udp": true,
-                "skip-cert-verify": ($skip_verify_bool == "true"),
-                "network": "ws",
-                "sni": $sn,
-                "ws-opts": {
-                    "path": $wsp,
+                "alpn": ["h2"],
+                "ech": true,
+                "network": "xhttp",
+                "xhttp-opts": {
+                    "path": $xp,
                     "headers": {
-                        "Host": $host_header
+                        "Host": $sn
                     }
                 }
             }')
-            
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _success "Trojan (WebSocket+TLS) 节点 [${name}] 添加成功!"
-    _success "客户端连接地址 (server): ${client_server_addr}"
-    _success "客户端连接端口 (port): ${client_port}"
-    _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
-    
-    # CDN 指引 (仅在非批量模式下详细显示)
-    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
-
-    # IPv6 处理用于链接
-    local link_ip="$client_server_addr"
-    _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path" || return 1
-}
-
-_create_anytls_tls_node() {
-    local node_ip="$1"
-    local port="$2"
-    local server_name="$3"
-    local password="$4"
-    local name="$5"
-
-    # --- 步骤 4: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (推荐)"
-        echo "  2) 手动上传证书文件 (Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-    
-    local cert_path=""
-    local key_path=""
-    local skip_verify=true  # 默认跳过验证 (自签证书需要)
-    local tag="anytls-in-${port}"
-    
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${server_name} 对应的证书文件路径。"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-        
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用自签名证书或Cloudflare源证书? (y/N): "${NC})" use_self_signed
-        if [[ "$use_self_signed" == "y" || "$use_self_signed" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'，客户端将跳过证书验证。"
-        else
-            skip_verify=false
-        fi
-    fi
-    
-    # IPv6 处理
-    local yaml_ip="$node_ip"
-    local link_ip="$node_ip"
-    [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    # --- 生成 Inbound 配置 (包含 padding_scheme) ---
-    # padding_scheme 是 AnyTLS 的核心功能，用于流量填充对抗检测
-    local inbound_json=$(jq -n \
-        --arg t "$tag" \
-        --arg p "$port" \
-        --arg pw "$password" \
-        --arg sn "$server_name" \
-        --arg cp "$cert_path" \
-        --arg kp "$key_path" \
-        '{
-            "type": "anytls",
-            "tag": $t,
-            "listen": "::",
-            "listen_port": ($p|tonumber),
-            "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [
-                "stop=2",
-                "0=100-200",
-                "1=100-200"
-            ],
-            "tls": {
-                "enabled": true,
-                "alpn": ["http/1.1"],
-                "certificate_path": $cp,
-                "key_path": $kp
-            }
-        }')
-    
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    
-    # --- 生成 Clash YAML 配置 ---
-    # 根据用户提供的格式：包含 client-fingerprint, udp, alpn
-    local proxy_json=$(jq -n \
+    local meta_json=$(jq -n \
         --arg n "$name" \
-        --arg s "$yaml_ip" \
-        --arg p "$port" \
-        --arg pw "$password" \
-        --arg sn "$server_name" \
-        --arg skip_verify_bool "$skip_verify" \
-        '{
-            "name": $n,
-            "type": "anytls",
-            "server": $s,
-            "port": ($p|tonumber),
-            "password": $pw,
-            "client-fingerprint": "chrome",
-            "udp": true,
-            "idle-session-check-interval": 30,
-            "idle-session-timeout": 30,
-            "min-idle-session": 0,
-            "sni": $sn,
-            "alpn": ["h2", "http/1.1"],
-            "skip-cert-verify": ($skip_verify_bool == "true")
-        }')
-    
-    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    
-    # --- 保存元数据 ---
-    local meta_json
-    meta_json=$(jq -n --arg n "$name" --arg sn "$server_name" '{name:$n, server_name:$sn, yaml:true}')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
-    
-    # _show_node_link 负责输出并保存最终分享链接。
-    _success "AnyTLS 节点 [${name}] 添加成功!"
-    _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify" "$cert_path" || return 1
+        --arg sn "$camouflage_domain" \
+        --arg enc "$client_encryption" \
+        --arg dec "$server_decryption" \
+        --arg pk "$public_key" \
+        --arg sk "$private_key" \
+        '{name:$n, server_name:$sn, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" '. + {($tag): $meta}' --arg tag "$tag" --argjson meta "$meta_json" || return 1
+    echo ""
+    _success "VLESS (XHTTP + TLS + ENC + Vision) 过 CDN 节点 [${name}] 添加成功!"
+    _success "客户端连接: ${link_ip}:443 (TLS, SNI/Host: ${camouflage_domain}, ECH 默认开启)"
+    _success "源站监听端口: ${port} (CF Full/Full Strict 回源)"
+    _success "XHTTP 路径: ${xhttp_path} (分享链接默认 mode=stream-one; 服务端不限制, 客户端仍可改)"
+    _show_cdn_guidance "${camouflage_domain}" "${port}"
+    _show_node_link "vless-xhttp-enc-tls" "$name" "$link_ip" "443" "$tag" "$uuid" "$camouflage_domain" "$xhttp_path" "false" "$cert_path" "$client_encryption"
 }
 
-_create_anyreality_node() {
-    local node_ip="$1"
-    local port="$2"
-    local server_name="$3"
-    local password="$4"
-    local name="$5"
-    local tag="any-reality-in-${port}"
-
-    local keypair private_key public_key short_id
-    keypair=$(${SINGBOX_BIN} generate reality-keypair)
-    private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-    public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-    short_id=$(${SINGBOX_BIN} generate rand --hex 8)
-
-    local inbound_json=$(jq -n \
-        --arg t "$tag" \
-        --arg p "$port" \
-        --arg pw "$password" \
-        --arg sn "$server_name" \
-        --arg pk "$private_key" \
-        --arg sid "$short_id" \
-        '{
-            "type": "anytls",
-            "tag": $t,
-            "listen": "::",
-            "listen_port": ($p|tonumber),
-            "users": [{"name": "default", "password": $pw}],
-            "padding_scheme": [],
-            "tls": {
-                "enabled": true,
-                "server_name": $sn,
-                "reality": {
-                    "enabled": true,
-                    "handshake": {
-                        "server": $sn,
-                        "server_port": 443
-                    },
-                    "private_key": $pk,
-                    "short_id": [$sid]
-                }
-            }
-        }')
-
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-
-    local link_ip="$node_ip"
-    [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
-    local meta_json
-    meta_json=$(jq -n \
-        --arg type "any-reality" \
-        --arg sn "$server_name" \
-        --arg pub "$public_key" \
-        --arg sid "$short_id" \
-        --arg link "$share_link" \
-        --arg n "$name" \
-        '{type:$type, name:$n, server_name:$sn, publicKey:$pub, shortId:$sid, share_link:$link, yaml:false}')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
-
-    _success "Any-Reality 节点 [${name}] 添加成功!"
-    _warning "Any-Reality 为 AnyTLS + Reality，Mihomo/Clash 不支持，已跳过写入 clash.yaml。"
-    _show_node_link "any-reality" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$public_key" "$short_id" || return 1
-}
-
-_add_anytls() {
-    local node_ip="${server_ip}"
-    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local port=""
-    local server_name="www.analog.com"
-    local mode_choice="1"
-
-    if [ "$BATCH_MODE" = "true" ]; then
-        port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.analog.com}"
-        mode_choice="${BATCH_ANYTLS_MODE:-1}"
-    else
-        _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
-        echo "请选择节点协议:"
-        echo "  1) AnyTLS"
-        echo "  2) Any-Reality"
-        echo "  1,2) 同时创建 AnyTLS 和 Any-Reality"
-        read -p "请选择 [1/2/1,2] (默认: 1): " mode_choice
-        mode_choice=${mode_choice:-1}
-        mode_choice=$(echo "$mode_choice" | tr '，' ',' | xargs)
-        case "$mode_choice" in
-            1|2|1,2|2,1|"1 2"|"2 1") ;;
-            *) _error "无效选择"; return 1 ;;
-        esac
-
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
-        while true; do
-            read -p "请输入起始监听端口: " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
-            if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
-                local reality_port=$((port + 1))
-                if [ "$reality_port" -gt 65535 ]; then
-                    _error "同时创建两个节点时，起始端口不能为 65535。"
-                    continue
-                fi
-                _check_port_conflict "$reality_port" "tcp" && continue
-            fi
-            break
-        done
-        read -p "请输入伪装域名/SNI (默认: www.analog.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.analog.com"}
-    fi
-
-    local password=""
-    if [ "$BATCH_MODE" = "true" ]; then
-        password=$(${SINGBOX_BIN} generate uuid)
-    else
-        read -p "请输入密码/UUID (回车则随机生成，两种模式共用): " input_pw
-        password=${input_pw:-$(${SINGBOX_BIN} generate uuid)}
-    fi
-
-    local created=false
-    case "$mode_choice" in
-        1)
-            local name
-            if [ "$BATCH_MODE" = "true" ]; then
-                name="Batch-AnyTLS-${port}"
-            else
-                local default_name="AnyTLS-${port}"
-                read -p "请输入 AnyTLS 节点名称 (默认: ${default_name}): " custom_name
-                name=${custom_name:-$default_name}
-            fi
-            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" || return 1
-            created=true
-            ;;
-        2)
-            local name
-            if [ "$BATCH_MODE" = "true" ]; then
-                name="Batch-Any-Reality-${port}"
-            else
-                local default_name="Any-Reality-${port}"
-                read -p "请输入 Any-Reality 节点名称 (默认: ${default_name}): " custom_name
-                name=${custom_name:-$default_name}
-            fi
-            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" || return 1
-            created=true
-            ;;
-        1,2|2,1|"1 2"|"2 1")
-            local tls_port="$port"
-            local reality_port=$((port + 1))
-            local tls_name reality_name
-            if [ "$BATCH_MODE" = "true" ]; then
-                tls_name="Batch-AnyTLS-${tls_port}"
-                reality_name="Batch-Any-Reality-${reality_port}"
-            else
-                local default_tls_name="AnyTLS-${tls_port}"
-                local default_reality_name="Any-Reality-${reality_port}"
-                _info "同时创建时，Any-Reality 将使用端口 ${reality_port}。"
-                read -p "请输入 AnyTLS 节点名称 (默认: ${default_tls_name}): " custom_tls_name
-                tls_name=${custom_tls_name:-$default_tls_name}
-                read -p "请输入 Any-Reality 节点名称 (默认: ${default_reality_name}): " custom_reality_name
-                reality_name=${custom_reality_name:-$default_reality_name}
-            fi
-            _create_anytls_tls_node "$node_ip" "$tls_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$reality_port" "$server_name" "$password" "$reality_name" || return 1
-            created=true
-            ;;
-    esac
-
-    [ "$created" = true ]
-}
 
 _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local server_name="www.analog.com"
+    local server_name="$(_pick_random_default_sni)"
     local port=""
     local name=""
 
@@ -4807,23 +3080,23 @@ _add_vless_reality() {
         port="$BATCH_PORT"
         # 批量模式变量预加载，增加多层保底，防止变量泄露
         server_name=$(echo "${BATCH_SNI}" | xargs)
-        [[ -z "$server_name" ]] && server_name="$DEFAULT_SNI"
+        [[ -z "$server_name" ]] && server_name="$(_pick_random_default_sni)"
         name="Batch-VLESS-TCP-Reality-Vision-${port}"
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.analog.com"}
+        read -r -p "请输入伪装域名 (默认: ${server_name}): " camouflage_domain
+        server_name=${camouflage_domain:-"$server_name"}
         while true; do
-            read -p "请输入监听端口: " port
+            read -r -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
         done
         local default_name="VLESS-TCP-REALITY-VISION-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
 
@@ -4836,12 +3109,12 @@ _add_vless_reality() {
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
+
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pk "$private_key" --arg sid "$short_id" \
         '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"publicKey\": \"$public_key\", \"shortId\": \"$short_id\"}}" || return 1
-    
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
+    _atomic_modify_json "$METADATA_FILE" '. + {($tag): {publicKey: $pk, shortId: $sid}}' --arg tag "$tag" --arg pk "$public_key" --arg sid "$short_id" || return 1
+
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg sn "$server_name" --arg pbk "$public_key" --arg sid "$short_id" \
         '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":true,"network":"tcp","flow":"xtls-rprx-vision","servername":$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
@@ -4849,60 +3122,128 @@ _add_vless_reality() {
     _show_node_link "vless-reality" "$name" "$link_ip" "$port" "$tag" "$uuid" "$server_name" "$public_key" "$short_id" || return 1
 }
 
-_add_vless_tcp() {
+_add_vless_enc_tcp() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
+    local name=""
+
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        if [ -z "$port" ]; then
-            _error "批量创建错误: BATCH_PORT 为空，跳过 VLESS (TCP) 安装。"
-            return 1
-        fi
+        [ -z "$node_ip" ] && node_ip="$server_ip"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        _info "--- VLESS (TCP + ENC + Vision) 设置向导 ---"
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
         while true; do
-            read -p "请输入监听端口: " port
+            read -r -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
         done
     fi
-    # [!] 自定义名称 (批量模式下自动分配)
-    local default_name="VLESS-TCP-${port}"
-    local name=""
+
+    local default_name="VLESS-ENC-TCP-${port}"
     if [ "$BATCH_MODE" = "true" ]; then
-        name="Batch-TCP-${port}"
+        name="Batch-VLESS-ENC-${port}"
     else
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
 
     local uuid=$(${SINGBOX_BIN} generate uuid)
-    local tag="vless-tcp-in-${port}"
-    # IPv6处理：YAML用原始IP，链接用带[]的IP
+    local tag="vless-enc-in-${port}"
     local yaml_ip="$node_ip"
-    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
-    
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" \
-        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":""}],"tls":{"enabled":false}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" \
-        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"tls":false,"network":"tcp"}')
+    local link_ip="$node_ip"
+    [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+
+    # 生成 X25519 密钥对
+    local keypair private_key="" public_key=""
+    if [ -x "${SINGBOX_BIN}" ]; then
+        keypair=$(${SINGBOX_BIN} generate reality-keypair 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v xray &>/dev/null; then
+        keypair=$(xray x25519 2>/dev/null)
+        private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+        public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+    fi
+    if { [ -z "$private_key" ] || [ -z "$public_key" ]; } && command -v openssl &>/dev/null; then
+        local raw_priv
+        raw_priv=$(openssl genpkey -algorithm X25519 2>/dev/null)
+        if [ -n "$raw_priv" ]; then
+            private_key=$(echo "$raw_priv" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+            public_key=$(echo "$raw_priv" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\n\r ' | tr '+/' '-_' | tr -d '=')
+        fi
+    fi
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        _error "VLESS ENC X25519 密钥生成失败！"
+        return 1
+    fi
+
+    local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+    local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+
+    # Inbound: 纯 TCP + Vision + Decryption (无 TLS)
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg dec "$server_decryption" \
+        '{
+            "type": "vless",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"uuid": $u, "flow": "xtls-rprx-vision"}],
+            "decryption": $dec
+        }')
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
+
+    # Mihomo / Clash Meta 客户端配置
+    local proxy_json=$(jq -n \
+        --arg n "$name" \
+        --arg s "$yaml_ip" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg enc "$client_encryption" \
+        '{
+            "name": $n,
+            "type": "vless",
+            "server": $s,
+            "port": ($p|tonumber),
+            "uuid": $u,
+            "network": "tcp",
+            "tls": false,
+            "flow": "xtls-rprx-vision",
+            "encryption": $enc,
+            "udp": true
+        }')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _success "VLESS (TCP) 节点 [${name}] 添加成功!"
-    _warn "此节点为明文 VLESS；v2rayN 使用新版 Xray 核心时会拒绝公网地址，可在核心类型设置中将 VLESS 改为 sing-box。"
-    _show_node_link "vless-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid" || return 1
+
+    # 保存元数据
+    local meta_json=$(jq -n \
+        --arg n "$name" \
+        --arg enc "$client_encryption" \
+        --arg dec "$server_decryption" \
+        --arg pk "$public_key" \
+        --arg sk "$private_key" \
+        '{name:$n, encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk, yaml:true}')
+    _atomic_modify_json "$METADATA_FILE" '. + {($tag): $meta}' --arg tag "$tag" --argjson meta "$meta_json" || return 1
+
+    _success "VLESS (ENC + XTLS-Vision 纯TCP) 落地节点 [${name}] 添加成功!"
+    _show_node_link "vless-enc-tcp" "$name" "$link_ip" "$port" "$tag" "$uuid" "$client_encryption" || return 1
 }
+
 
 _add_hysteria2() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.analog.com"
+    local server_name="$(_pick_random_default_sni)"
     local obfs_password=""
     local port_hopping=""
     local use_multiport="false"
@@ -4914,6 +3255,7 @@ _add_hysteria2() {
             return 1
         fi
         server_name="$BATCH_SNI"
+        [ -z "$server_name" ] && server_name="$(_pick_random_default_sni)"
         # 批量模式 double check
         [ -z "$node_ip" ] && node_ip="$server_ip"
         [ "$BATCH_HY2_OBFS" != "none" ] && obfs_password=$(${SINGBOX_BIN} generate rand --hex 16)
@@ -4945,16 +3287,16 @@ _add_hysteria2() {
             use_multiport="true"
         fi
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
         while true; do
-            read -p "请输入监听端口: " port
+            read -r -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.analog.com"}
+        read -r -p "请输入伪装域名 (默认: ${server_name}): " camouflage_domain
+        server_name=${camouflage_domain:-"$server_name"}
     fi
 
     local tag="hy2-in-${port}"
@@ -4966,14 +3308,14 @@ _add_hysteria2() {
     if [ "$BATCH_MODE" = "true" ]; then
         password=$(${SINGBOX_BIN} generate rand --hex 16)
     else
-        read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
-        read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " h_choice
+        read -r -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
+        read -r -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " h_choice
         if [[ "$h_choice" == "y" ]]; then
             obfs_password=$(${SINGBOX_BIN} generate rand --hex 16)
         fi
-        read -p "是否开启端口跳跃? (y/N): " hop_choice
+        read -r -p "是否开启端口跳跃? (y/N): " hop_choice
         if [[ "$hop_choice" == "y" ]]; then
-            read -p "请输入端口范围 (如 20000-30000): " port_range
+            read -r -p "请输入端口范围 (如 20000-30000): " port_range
             if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 port_range_start="${BASH_REMATCH[1]}"
                 port_range_end="${BASH_REMATCH[2]}"
@@ -5004,17 +3346,17 @@ _add_hysteria2() {
             fi
         fi
     fi
-    
+
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
         name="Batch-Hysteria2-${port}"
     else
         local default_name="Hysteria2-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
-    
+
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
@@ -5023,7 +3365,7 @@ _add_hysteria2() {
 
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
         '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
 
     # [!] 多端口监听模式逻辑：优先使用 nftables，失败则降级到 JSON Inbound (带数量保护)
     local port_hopping_mode=""
@@ -5043,15 +3385,16 @@ _add_hysteria2() {
             if [ "$hop_count" -le 1000 ]; then
                 _info "正在生成原生大量监听配置块 (${port_range_start}-${port_range_end})..."
                 local batch_array="[]"
-                local skipped=0
+                local skipped=0 hop_ports=""
                 for ((p=port_range_start; p<=port_range_end; p++)); do
                     if [ "$p" -eq "$port" ]; then continue; fi
                     if _check_port_conflict "$p" "udp" "true"; then ((skipped++)); continue; fi
-                    local hop_tag="${tag}-hop-${p}"
-                    batch_array=$(echo "$batch_array" | jq --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" \
-                        '. += [{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end]')
+                    hop_ports="$hop_ports $p"
                 done
-                _atomic_modify_json "$CONFIG_FILE" ".inbounds += $batch_array | .inbounds |= unique_by(.tag)" || return 1
+                if [ -n "$hop_ports" ]; then
+                    batch_array=$(jq -cn --arg t "$tag" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" --arg ports "$hop_ports" '($ports | split(" ") | map(select(. != "") | tonumber)) as $ps | [ $ps[] | {type:"hysteria2",tag:($t + "-hop-" + (. | tostring)),listen:"::",listen_port:.,users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end ]') || return 1
+                fi
+                _atomic_modify_json "$CONFIG_FILE" '.inbounds += $batch | .inbounds |= unique_by(.tag)' --argjson batch "$batch_array" || return 1
                 local added_count=$(echo "$batch_array" | jq 'length')
                 port_hopping_mode="native"
                 _success "安全降级成功：已硬编码 ${added_count} 个原生辅助监听节点 (跳过 ${skipped} 个冲突端口)。"
@@ -5063,18 +3406,18 @@ _add_hysteria2() {
             fi
         fi
     fi
-    
+
     # 保存元数据（包含端口跳跃信息）
     local meta_json=$(jq -n --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" --arg hop_mode "$port_hopping_mode" \
         '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end | if $hop != "" then .portHopping = $hop else . end | if $hop_mode != "" then .portHoppingMode = $hop_mode else . end')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+    _atomic_modify_json "$METADATA_FILE" '. + {($tag): $meta}' --arg tag "$tag" --argjson meta "$meta_json" || return 1
 
     # Clash 配置中的端口（如果有端口跳跃，使用范围格式）
     local clash_ports="$port"
     if [ -n "$port_hopping" ]; then
         clash_ports="$port_hopping"
     fi
-    
+
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" \
         '{
             "name": $n,
@@ -5089,14 +3432,14 @@ _add_hysteria2() {
             "down": ($down|tonumber)
         } | if $op != "" then .obfs = "salamander" | .["obfs-password"] = $op else . end | if $hop != "" then .ports = $hop else . end')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    
+
     _success "Hysteria2 节点 [${name}] 添加成功!"
-    
+
     # 显示端口跳跃信息
     if [ -n "$port_hopping" ]; then
         _info "端口跳跃范围: ${port_hopping}"
     fi
-    
+
     _show_node_link "hysteria2" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$obfs_password" "$port_hopping" || return 1
 }
 
@@ -5104,39 +3447,40 @@ _add_tuic() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.analog.com"
+    local server_name="$(_pick_random_default_sni)"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.analog.com}"
+        server_name="$BATCH_SNI"
+        [ -z "$server_name" ] && server_name="$(_pick_random_default_sni)"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
         while true; do
-            read -p "请输入监听端口: " port
+            read -r -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.analog.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.analog.com"}
+        read -r -p "请输入伪装域名 (默认: ${server_name}): " camouflage_domain
+        server_name=${camouflage_domain:-"$server_name"}
     fi
 
     local tag="tuic-in-${port}"
     local cert_path="${SINGBOX_DIR}/${tag}.pem"
     local key_path="${SINGBOX_DIR}/${tag}.key"
-    
+
     _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
 
     local uuid=$(${SINGBOX_BIN} generate uuid); local password=$(${SINGBOX_BIN} generate rand --hex 16)
-    
+
     # [!] 自主生成与名称分配
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
         name="Batch-TUICv5-${port}"
     else
         local default_name="TUICv5-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
 
@@ -5145,8 +3489,8 @@ _add_tuic() {
 
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
         '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-    
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inb] | .inbounds |= unique_by(.tag)' --argjson inb "$inbound_json" || return 1
+
     local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
         '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
@@ -5247,27 +3591,34 @@ _add_shadowsocks_menu() {
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
     else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        read -r -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入监听端口: " port; [[ -z "$port" ]] && _error "端口不能为空" && return 1
+        local ss_proto="tcp+udp"
+        [ "$use_shadowtls" = "true" ] && ss_proto="tcp"
+        while true; do
+            read -r -p "请输入监听端口: " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "$ss_proto" && continue
+            break
+        done
     fi
-    
+
     # [!] 新增：自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
         name="Batch-${name_prefix}-${port}"
     else
         local default_name="${name_prefix}-${port}"
-        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        read -r -p "请输入节点名称 (默认: ${default_name}): " custom_name
         name=${custom_name:-$default_name}
     fi
-    
+
     local shadowtls_password=""
-    local shadowtls_sni="www.analog.com"
+    local shadowtls_sni="$(_pick_random_default_sni)"
     if [ "$use_shadowtls" == "true" ]; then
         shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.analog.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.analog.com}
+        read -r -p "请输入 ShadowTLS 伪装白名单域名 (默认: ${shadowtls_sni}): " custom_sni
+        shadowtls_sni=${custom_sni:-"$shadowtls_sni"}
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -5277,8 +3628,7 @@ _add_shadowsocks_menu() {
     # 根据是否启用 Multiplex 或 ShadowTLS 生成不同配置
     local inbound_json=""
     local shadowtls_inner_tag=""
-    local jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
-    
+
     if [ "$use_shadowtls" == "true" ]; then
         local ss_tag="${tag}-ss"
         shadowtls_inner_tag="$ss_tag"
@@ -5308,11 +3658,10 @@ _add_shadowsocks_menu() {
                     "password": $pw
                 }
             ]')
-        jq_modify_expr=".inbounds += $inbound_json | .inbounds |= unique_by(.tag)"
     elif [ "$use_multiplex" == "true" ]; then
         # 带 Multiplex + Padding 的配置
         inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
-            '{
+            '[{
                 "type": "shadowsocks",
                 "tag": $t,
                 "listen": "::",
@@ -5323,22 +3672,20 @@ _add_shadowsocks_menu() {
                     "enabled": true,
                     "padding": true
                 }
-            }')
-        jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
+            }]')
     else
         # 标准配置
         inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg m "$method" --arg pw "$password" \
-            '{
+            '[{
                 "type": "shadowsocks",
                 "tag": $t,
                 "listen": "::",
                 "listen_port": ($p|tonumber),
                 "method": $m,
                 "password": $pw
-            }')
-        jq_modify_expr=".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)"
+            }]')
     fi
-    _atomic_modify_json "$CONFIG_FILE" "$jq_modify_expr" || return 1
+    _atomic_modify_json "$CONFIG_FILE" '.inbounds += $inbs | .inbounds |= unique_by(.tag)' --argjson inbs "$inbound_json" || return 1
 
     # YAML 配置也需要根据特定状态生成
     local proxy_json=""
@@ -5385,8 +3732,7 @@ _add_shadowsocks_menu() {
     fi
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
 
-    # ShadowTLS 没有标准单行分享链接，仍需记录归属和内外层关系，供
-    # 查看、删除、改端口及“删除全部”进行精准管理。
+    # ShadowTLS 无标准单行分享链接, 仍记归属与内外层关系供管理用。
     if [ "$use_shadowtls" = "true" ]; then
         _atomic_modify_json "$METADATA_FILE" '. + {($tag): ((.[$tag] // {}) + {name:$name, owner:"singbox-main", yaml:true, composite:"shadowtls", inner_tag:$inner})}' \
             --arg tag "$tag" --arg name "$name" --arg inner "$shadowtls_inner_tag" || return 1
@@ -5404,111 +3750,11 @@ _add_shadowsocks_menu() {
     return 0
 }
 
-_add_socks() {
-    local node_ip="${server_ip}"
-    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local port=""
-    local username=""
-    local password=""
-
-    if [ "$BATCH_MODE" = "true" ]; then
-        port="$BATCH_PORT"
-        if [ -z "$port" ]; then
-            _error "批量创建错误: BATCH_PORT 为空，跳过 SOCKS5 安装。"
-            return 1
-        fi
-        username=$(${SINGBOX_BIN} generate rand --hex 8)
-        password=$(${SINGBOX_BIN} generate rand --hex 16)
-    else
-        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
-        node_ip=${custom_ip:-$server_ip}
-        while true; do
-            read -p "请输入监听端口: " port
-            [[ -z "$port" ]] && _error "端口不能为空" && continue
-            _check_port_conflict "$port" "tcp" && continue
-            break
-        done
-        read -p "请输入用户名 (默认随机): " username; username=${username:-$(${SINGBOX_BIN} generate rand --hex 8)}
-        read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
-    fi
-    local tag="socks-in-${port}"
-    local name="Batch-SOCKS5-${port}"
-    [ "$BATCH_MODE" != "true" ] && name="SOCKS5-${port}"
-    local display_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && display_ip="[$node_ip]"
-
-    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$username" --arg pw "$password" \
-        '{"type":"socks","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"username":$u,"password":$pw}]}')
-    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
-
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$display_ip" --arg p "$port" --arg u "$username" --arg pw "$password" \
-        '{"name":$n,"type":"socks5","server":$s,"port":($p|tonumber),"username":$u,"password":$pw}')
-    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
-    _atomic_modify_json "$METADATA_FILE" '. + {($tag): ((.[$tag] // {}) + {name:$name, owner:"singbox-main", yaml:true})}' \
-        --arg tag "$tag" --arg name "$name" || return 1
-    _success "SOCKS5 节点添加成功!"
-    _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password" || return 1
-}
-
-_add_snell_v6() {
-    local core_version server port name tag psk inbound proxy
-    core_version=$("$SINGBOX_BIN" version 2>/dev/null | awk 'NR == 1 {print $3}')
-    if ! [[ "$core_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] ||
-        ! (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 14) )); then
-        _error "Snell v6 需要 sing-box 1.14.0 或以上的稳定版，请通过主菜单 [15] 安装。"
-        return 1
-    fi
-
-    read -r -p "请输入客户端连接地址 (默认: ${server_ip}): " server || return 1
-    server=$(_normalize_client_server "${server:-$server_ip}")
-    if ! [[ "$server" =~ ^[A-Za-z0-9._-]+$ || "$server" =~ ^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+$ || "$server" == "::" ]]; then
-        _error "请输入 IPv4、IPv6 或域名。"
-        return 1
-    fi
-    while true; do
-        read -r -p "请输入 TCP 监听端口: " port || return 1
-        if ! _check_port_conflict "$port" tcp; then
-            port=$((10#$port))
-            break
-        fi
-    done
-    tag="snell-in-${port}"
-    read -r -p "请输入节点名称 (默认: Snell-v6-${port}): " name || return 1
-    name="${name:-Snell-v6-${port}}"
-    psk=$("$SINGBOX_BIN" generate rand --hex 16) && [[ "$psk" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
-
-    inbound=$(jq -cn --arg tag "$tag" --argjson port "$port" --arg psk "$psk" '
-        {type:"snell",tag:$tag,listen:"::",listen_port:$port,version:6,mode:"default",psk:$psk}
-    ') || return 1
-    proxy=$(jq -cn --arg name "$name" --arg server "$server" --argjson port "$port" --arg psk "$psk" '
-        {name:$name,type:"snell",server:$server,port:$port,version:6,mode:"default",psk:$psk,udp:true,reuse:false}
-    ') || return 1
-
-    _atomic_modify_json "$CONFIG_FILE" '.inbounds += [$inbound]' --argjson inbound "$inbound" || return 1
-    _add_node_to_yaml "$proxy" || return 1
-    _atomic_modify_json "$METADATA_FILE" '.[$tag] = {name:$name,owner:"singbox-main",variant:"snell-v6",clientServer:$server,yaml:true}' \
-        --arg tag "$tag" --arg name "$name" --arg server "$server" || return 1
-    _info "可在主菜单的查看节点选项中获取 Snell v6 客户端配置。"
-}
-
-_show_snell_v6_client_config() {
-    local node="$1" tag="$2" server="$3" port="$4" psk
-    [ -n "$server" ] || { _error "Snell 节点缺少客户端连接地址。"; return 1; }
-    psk=$(jq -er '.psk | select(type == "string" and length >= 12)' <<< "$node") || return 1
-    echo "  Mihomo YAML: $CLASH_YAML_FILE"
-    echo "  sing-box / v2rayN 自定义 JSON:"
-    jq -n --arg server "$server" --argjson port "$port" --arg psk "$psk" '
-        {inbounds:[{type:"mixed",listen:"127.0.0.1",listen_port:10808}],
-         outbounds:[{type:"snell",tag:"proxy",server:$server,server_port:$port,version:6,mode:"default",psk:$psk,reuse:false}],
-         route:{final:"proxy"}}
-    ' || return 1
-    echo "  Surge [Proxy]:"
-    printf '  %s = snell, %s, %s, psk=%s, version=6, mode=default, reuse=false\n' "$tag" "$server" "$port" "$psk"
-}
 
 _view_nodes() {
     local primary_nodes
     primary_nodes=$(_list_main_primary_inbounds)
-    if [ -z "$primary_nodes" ]; then _warning "当前没有可由主节点菜单管理的节点（Argo 请在 Argo 菜单管理）。"; return; fi
+    if [ -z "$primary_nodes" ]; then _warning "当前没有可由主节点菜单管理的节点。"; return; fi
 
     local node_count
     node_count=$(printf '%s\n' "$primary_nodes" | awk 'NF {count++} END {print count+0}')
@@ -5518,7 +3764,7 @@ _view_nodes() {
     local links_tmp
     links_tmp=$(mktemp /tmp/singbox_links.XXXXXX) || { _error "无法创建临时订阅文件。"; return 1; }
     VIEW_LINKS_TMP="$links_tmp"
-    
+
     # [资源优化] 传递紧凑 JSON，循环内用单次 jq 提取 tag/type/port (3次→1次)
     while IFS= read -r node; do
         # 合并3次字段提取为1次
@@ -5526,7 +3772,9 @@ _view_nodes() {
         _base_fields=$(echo "$node" | jq -r '[.tag, .type, (.listen_port|tostring)] | @tsv')
         local tag type port
         IFS=$'\t' read -r tag type port <<< "$_base_fields"
-        
+
+        # 循环变量在 Bash 里跨迭代保留, 光 local 声明不清零, 必须显式清零。
+        local tls_sn="" uuid="" flow="" is_reality="" transport_type="" tls_enabled="" cert_path="" ws_path="" grpc_service_name="" password="" method="" sn=""
         # 使用统一查找函数
         local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
 
@@ -5540,24 +3788,18 @@ _view_nodes() {
         local display_ip=$(echo "$display_server" | tr -d '[]')
         # IPv6链接格式：添加[]
         local link_ip="$display_ip"; [[ "$display_ip" == *":"* ]] && link_ip="[$display_ip]"
-        
+
         echo "-------------------------------------"
         # [!] 已修改：使用 display_name
         _info " 节点: ${display_name}"
-        if [ "$type" = "snell" ] && [[ "$tag" == snell-in-* ]]; then
-            local snell_server
-            snell_server=$(jq -r --arg tag "$tag" '.[$tag].clientServer // empty' "$METADATA_FILE")
-            _show_snell_v6_client_config "$node" "$tag" "${snell_server:-$display_ip}" "$port"
-            continue
-        fi
         local url=""
-        
+
         # [新架构] 优先使用持久化生成的链接（从极源解决动态提取可能存在的 SNI 丢失死角）
         url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$METADATA_FILE")
         if { [ -z "$url" ] || [ "$url" == "null" ]; } && [[ "$tag" == argo-* ]] && [ -f "$ARGO_METADATA_FILE" ]; then
             url=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
         fi
-        
+
         if [ -n "$url" ] && [ "$url" != "null" ]; then
             : # 直接使用持久化链接
         else
@@ -5565,26 +3807,43 @@ _view_nodes() {
             "vless")
                 # [资源优化] 合并 VLESS 关键字段读取，避免循环内多次 jq
                 local _vless_fields
-                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.analog.com
-            _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.analog.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
+            _vless_fields=$(echo "$node" | jq -r --arg def_sni "$DEFAULT_SNI" '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // $def_sni), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
             IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn cert_path ws_path grpc_service_name <<< "$_vless_fields"
-                
+
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
                 [ "$is_reality" == "true" ] && [ -z "$flow" ] && flow="xtls-rprx-vision"
-                
+
                 if [ "$is_reality" == "true" ]; then
                     # [修复] 放弃对 Base64/Hex 密钥使用 @tsv，避免损坏
                     local pk=$(jq -r --arg t "$tag" '.[$t].publicKey // empty' "$METADATA_FILE")
                     local sid=$(jq -r --arg t "$tag" '.[$t].shortId // empty' "$METADATA_FILE")
                     local sn="$tls_sn"
                     local fp="chrome"
-                    url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
+                    if [ "$transport_type" == "xhttp" ]; then
+                        local xp=$(echo "$node" | jq -r '.transport.path // "/"')
+                        local enc_key=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$METADATA_FILE")
+                        url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&pbk=$(_url_encode "${pk}")&fp=${fp}&sni=${sn}&sid=${sid}&path=$(_url_encode "$xp")&x_padding_bytes=100-1000#$(_url_encode "$display_name")"
+                    else
+                        url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "${pk}")&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
+                    fi
+                elif [ "$transport_type" == "xhttp" ]; then
+                    local xp=$(echo "$node" | jq -r '.transport.path // "/"')
+                    local enc_key=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$METADATA_FILE")
+                    if [ "$tls_enabled" == "true" ]; then
+                        local sn="$tls_sn"
+                        url="vless://${uuid}@${link_ip}:443?security=tls&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&alpn=h2&host=${sn}&path=$(_url_encode "$xp")&x_padding_bytes=100-1000&sni=${sn}&ech=${CDN_ECH}#$(_url_encode "$display_name")"
+                    else
+                        local host=$(jq -r --arg t "$tag" '.[$t].host // empty' "$METADATA_FILE")
+                        [ -z "$host" ] || [ "$host" == "null" ] && host=$(_get_proxy_field "$proxy_name_to_find" '.servername // .["xhttp-opts"].headers.Host // ""')
+                        [ -z "$host" ] && host="$DEFAULT_SNI"
+                        url="vless://${uuid}@${link_ip}:443?security=tls&alpn=h2&encryption=${enc_key}&flow=xtls-rprx-vision&type=xhttp&mode=stream-one&host=${host}&sni=${host}&path=$(_url_encode "$xp")&x_padding_bytes=100-1000#$(_url_encode "$display_name")"
+                    fi
                 elif [ "$transport_type" == "ws" ]; then
                     # ws_path 已在上方合并提取
                     local sn="$tls_sn"
                     [ -z "$sn" ] || [ "$sn" == "null" ] && sn=$(_get_proxy_field "$proxy_name_to_find" ".servername")
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
-                    
+
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
                     if [[ "$tag" == argo-* ]] && [ -f "$ARGO_METADATA_FILE" ]; then
@@ -5609,6 +3868,9 @@ _view_nodes() {
                 elif [ "$tls_enabled" == "true" ]; then
                     local sn="$tls_sn"
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
+                elif echo "$node" | jq -e '.decryption != null' >/dev/null 2>&1; then
+                    local enc_key=$(jq -r --arg t "$tag" '.[$t].encryption // empty' "$METADATA_FILE")
+                    url="vless://${uuid}@${link_ip}:${port}?encryption=${enc_key}&flow=xtls-rprx-vision&type=tcp#$(_url_encode "$display_name")"
                 else
                     url="vless://${uuid}@${link_ip}:${port}?encryption=none&type=tcp#$(_url_encode "$display_name")"
                 fi
@@ -5619,11 +3881,11 @@ _view_nodes() {
                 _trojan_fields=$(echo "$node" | jq -r '[.users[0].password, (.transport.type // ""), (.transport.path // "")] | @tsv')
                 local password transport_type ws_path
                 IFS=$'\t' read -r password transport_type ws_path <<< "$_trojan_fields"
-                
+
                 if [ "$transport_type" == "ws" ]; then
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                     url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
-                    
+
                     # Argo 节点元数据已迁移到 argo_metadata.json
                     local argo_domain=""
                     if [[ "$tag" == argo-* ]] && [ -f "$ARGO_METADATA_FILE" ]; then
@@ -5648,20 +3910,20 @@ _view_nodes() {
                 local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${op}")"
                 # 端口跳跃参数
                 local hop_param=""; [[ -n "$hop" && "$hop" != "null" ]] && hop_param="&mport=${hop}&ports=${hop}"
-                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
+                url="hysteria2://$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
                 ;;
             "tuic")
                 # [资源优化] 合并2次jq为1次
                 local uuid pw
                 IFS=$'\t' read -r uuid pw <<< "$(echo "$node" | jq -r '[.users[0].uuid, .users[0].password] | @tsv')"
                 local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
-                url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
+                url="tuic://${uuid}:$(_url_encode "$pw")@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
             "anytls")
                 # [资源优化] 合并2次jq为1次
                 local pw sn
                 # [加固] 允许 server_name 回溯
-                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.analog.com")] | @tsv')"
+                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r --arg def_sni "$DEFAULT_SNI" '[.users[0].password, (.tls.server_name // $def_sni)] | @tsv')"
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
@@ -5673,7 +3935,15 @@ _view_nodes() {
                 # [资源优化] 合并2次jq为1次
                 local method password
                 IFS=$'\t' read -r method password <<< "$(echo "$node" | jq -r '[.method, .password] | @tsv')"
-                url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
+                local userinfo=$(_ss_base64_encode "${method}:${password}")
+                url="ss://${userinfo}@${link_ip}:${port}#$(_url_encode "$display_name")"
+                ;;
+            "shadowtls")
+                local st_pw st_sni st_detour ss_method ss_pw
+                IFS=$'\t' read -r st_pw st_sni st_detour <<< "$(echo "$node" | jq -r '[(.users[0].password // ""), (.handshake.server // ""), (.detour // "")] | @tsv')"
+                IFS=$'\t' read -r ss_method ss_pw <<< "$(jq -r --arg t "$st_detour" '.inbounds[]? | select(.tag == $t) | [(.method // ""), (.password // "")] | @tsv' "$CONFIG_FILE" 2>/dev/null)"
+                _info "  类型: ShadowTLS v3 + SS, 地址: $display_server, 端口: $port, SNI: $st_sni"
+                _info "  SS加密: $ss_method, 请从 ${CLASH_YAML_FILE} 复制完整 YAML 块"
                 ;;
             "socks")
                 # [资源优化] 合并2次jq为1次
@@ -5688,11 +3958,11 @@ _view_nodes() {
         [ -n "$url" ] && echo "$url" >> "$links_tmp"
     done <<< "$primary_nodes"
     echo "-------------------------------------"
-    
+
     # 生成聚合 Base64 选项
     if [ -s "$links_tmp" ]; then
         echo ""
-        read -p "是否生成聚合 Base64 订阅? (y/N): " gen_base64
+        read -r -p "是否生成聚合 Base64 订阅? (y/N): " gen_base64
         if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
             echo ""
             _info "=== 聚合 Base64 订阅 ==="
@@ -5729,7 +3999,9 @@ _rollback_port_modify_state() {
 
 _delete_one_main_node_locked() (
     local tag="$1" type="$2" port="$3" display_name="$4" proxy_name="$5"
-    _is_argo_inbound_tag "$tag" && { _error "Argo 内部节点受保护，请使用 Argo 菜单管理。"; return 1; }
+    # 删 VLESS 入站时连带删 cloudflared 入站并清 argo_metadata.json。
+    local cf_tag=""
+    _is_argo_inbound_tag "$tag" && cf_tag="argo-cf-${port}"
     _validate_protected_yaml_metadata || return 1
 
     local node_count node_json node_fields
@@ -5774,17 +4046,21 @@ _delete_one_main_node_locked() (
 
     if ! _atomic_modify_json "$CONFIG_FILE" '
         .inbounds |= map(select(
-            .tag != $tag and .tag != $detour and (((.tag // "") | startswith($tag + "-hop-")) | not)
+            .tag != $tag and .tag != $detour and .tag != $cf_tag and (((.tag // "") | startswith($tag + "-hop-")) | not)
         ))
         | .route = (.route // {"rules":[]})
         | .route.rules = ((.route.rules // []) | map(select(.inbound != $tag)))
         | if $remove_outbound and $outbound != "" then .outbounds = ((.outbounds // []) | map(select(.tag != $outbound))) else . end
-    ' --arg tag "$tag" --arg detour "$detour" --arg outbound "$outbound_tag" --argjson remove_outbound "$([ "$node_type" = "third-party-adapter" ] && echo true || echo false)"; then
+    ' --arg tag "$tag" --arg detour "$detour" --arg cf_tag "$cf_tag" --arg outbound "$outbound_tag" --argjson remove_outbound "$([ "$node_type" = "third-party-adapter" ] && echo true || echo false)"; then
         return 1
     fi
     _atomic_modify_json "$METADATA_FILE" 'del(.[$tag], .[$detour])' --arg tag "$tag" --arg detour "$detour" || {
         return 1
     }
+    # Argo 元数据必须在 YAML 检查前清掉, 否则 _is_protected_yaml_name 还会护着它。
+    if [ -n "$cf_tag" ]; then
+        _atomic_modify_json "$ARGO_METADATA_FILE" 'del(.[$tag])' --arg tag "$tag" || return 1
+    fi
 
     if [ -n "$proxy_name" ] && ! _is_protected_yaml_name "$proxy_name"; then
         _remove_node_from_yaml "$proxy_name" || {
@@ -5865,26 +4141,31 @@ _delete_all_main_nodes_locked() (
         return 1
     fi
 
-    local argo_tags='[]'
-    if [ -s "$ARGO_METADATA_FILE" ]; then
-        argo_tags=$(jq -c 'keys' "$ARGO_METADATA_FILE" 2>/dev/null) || {
-            _error "Argo 元数据无效，拒绝批量删除以避免误删受保护节点。"
-            return 1
-        }
+    # 批量删除包括 Argo (入站与元数据全清), Xray/中转不在 inbounds 里不受影响。
+    if [ -s "$ARGO_METADATA_FILE" ] && ! jq empty "$ARGO_METADATA_FILE" >/dev/null 2>&1; then
+        _error "Argo 元数据无效，拒绝批量删除。"
+        return 1
     fi
     if ! _atomic_modify_json "$CONFIG_FILE" '
-        [.inbounds[]? | (.tag // "") as $tag | select(((($tag | startswith("argo-")) or ($argo | index($tag) != null))) | not) | $tag] as $removed
+        [.inbounds[]? | (.tag // "")] as $removed
         | [.route.rules[]? | .inbound as $in | select(($in | type) == "string" and ($removed | index($in) != null)) | .outbound] as $removed_outbounds
-        | .inbounds |= map((.tag // "") as $tag | select(($tag | startswith("argo-")) or ($argo | index($tag) != null)))
+        | .inbounds = []
         | .route = (.route // {"rules":[]})
-        | .route.rules = ((.route.rules // []) | map(.inbound as $in | select(((($in | type) == "string") and ($removed | index($in) != null)) | not)))
+        | .route.rules = []
         | .outbounds = ((.outbounds // []) | map(select((.tag as $tag | $removed_outbounds | index($tag)) == null)))
-    ' --argjson argo "$argo_tags"; then
+    '; then
         return 1
     fi
     _atomic_modify_json "$METADATA_FILE" '{}' || {
         return 1
     }
+    # 批量删除清掉了 route.rules；WARP 启用时把它的规则贴回去。
+    if _warp_enabled 2>/dev/null; then
+        _warp_apply_config --offline || return 1
+    fi
+    if [ -f "$ARGO_METADATA_FILE" ]; then
+        printf '%s\n' '{}' > "$ARGO_METADATA_FILE" || return 1
+    fi
 
     sort -u "$names_file" | while IFS= read -r proxy_name; do
         [ -n "$proxy_name" ] || continue
@@ -5938,7 +4219,7 @@ _delete_all_main_nodes_locked() (
     delete_all_committed=1
     trap - EXIT INT TERM
     rm -rf -- "$backup_dir" || _warn "批量删除事务快照目录清理失败: $backup_dir"
-    _success "主 sing-box 节点已全部删除；Argo、Xray、中转配置均已保留。"
+    _success "主 sing-box 节点（含 Argo）已全部删除；Xray、中转配置已保留。"
 )
 
 _delete_node() {
@@ -5962,14 +4243,14 @@ _delete_node() {
     done <<< "$primary_nodes"
 
     echo ""
-    echo -e "  ${RED}99)${NC} 删除所有主 sing-box 节点（保留 Argo/Xray/中转）"
+    echo -e "  ${RED}99)${NC} 删除所有节点（包括 Argo，保留 Xray/中转）"
     local num
-    read -p "请输入要删除的节点编号 (输入 0 返回): " num
+    read -r -p "请输入要删除的节点编号 (输入 0 返回): " num
     [[ "$num" =~ ^[0-9]+$ ]] || return
     [ "$num" -eq 0 ] && return
     if [ "$num" -eq 99 ]; then
         local confirm_all
-        read -p "$(echo -e ${RED}"确定删除所有主 sing-box 节点? 输入 yes 确认: "${NC})" confirm_all
+        read -r -p "$(echo -e ${RED}"确定删除所有主 sing-box 节点? 输入 yes 确认: "${NC})" confirm_all
         [ "$confirm_all" = "yes" ] || { _info "删除已取消。"; return; }
         _with_state_lock _delete_all_main_nodes_locked
         return
@@ -5977,7 +4258,7 @@ _delete_node() {
     local count=${#inbound_tags[@]}
     [ "$num" -le "$count" ] || { _error "编号超出范围。"; return; }
     local index=$((num - 1)) confirm
-    read -p "$(echo -e ${YELLOW}"确定要删除节点 ${display_names[$index]} 吗? (y/N): "${NC})" confirm
+    read -r -p "$(echo -e ${YELLOW}"确定要删除节点 ${display_names[$index]} 吗? (y/N): "${NC})" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { _info "删除已取消。"; return; }
     _with_state_lock _delete_one_main_node_locked \
         "${inbound_tags[$index]}" "${inbound_types[$index]}" "${inbound_ports[$index]}" \
@@ -6088,7 +4369,7 @@ _dns_config_menu() {
         echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-8]: " choice
+        read -r -p "  请输入选项 [0-8]: " choice
 
         dns_address=""
         dns_strategy="$current_strategy"
@@ -6115,7 +4396,7 @@ _dns_config_menu() {
                 echo "    2) prefer_ipv6（IPv6 优先）"
                 echo "    3) ipv4_only（仅 IPv4）"
                 echo "    4) ipv6_only（仅 IPv6）"
-                read -p "  请选择解析策略 [1-4]: " strategy_choice
+                read -r -p "  请选择解析策略 [1-4]: " strategy_choice
                 case "$strategy_choice" in
                     1) dns_strategy="prefer_ipv4" ;;
                     2) dns_strategy="prefer_ipv6" ;;
@@ -6155,9 +4436,13 @@ _detect_main_node_variant() {
     local tag="$1"
     jq -r --arg tag "$tag" '
         .inbounds[]? | select(.tag == $tag) |
-        if .type == "vless" and (.tls.reality.enabled // false) then "vless-reality"
+        if .type == "vless" and (.tls.reality.enabled // false) and .transport.type == "xhttp" then "vless-xhttp-reality-enc"
+        elif .type == "vless" and (.tls.reality.enabled // false) then "vless-reality"
+        elif .type == "vless" and .transport.type == "xhttp" and (.tls.enabled // false) then "vless-xhttp-enc-tls"
+        elif .type == "vless" and .transport.type == "xhttp" then "vless-xhttp-enc"
         elif .type == "vless" and .transport.type == "ws" then "vless-ws-tls"
         elif .type == "vless" and .transport.type == "grpc" then "vless-grpc-tls"
+        elif .type == "vless" and (.decryption != null) then "vless-enc-tcp"
         elif .type == "vless" then "vless-tcp"
         elif .type == "trojan" and .transport.type == "ws" then "trojan-ws-tls"
         elif .type == "anytls" and (.tls.reality.enabled // false) then "any-reality"
@@ -6167,7 +4452,6 @@ _detect_main_node_variant() {
         elif .type == "shadowtls" then "shadowsocks-shadowtls"
         elif .type == "shadowsocks" then "shadowsocks"
         elif .type == "socks" then "socks"
-        elif .type == "snell" and .version == 6 and (.tag | startswith("snell-in-")) then "snell-v6"
         else "unsupported"
         end
     ' "$CONFIG_FILE" 2>/dev/null | head -n 1
@@ -6198,8 +4482,7 @@ _legacy_link_server() {
 
 _validate_tls_key_pair() {
     local cert_path="$1" key_path="$2" cert_pub key_pub
-    # ACME 客户端通常用符号链接指向续签后的实际证书；只要链接当前可解析为
-    # 普通文件就应保留原路径，让后续续签无需再次修改节点。
+    # ACME 证书常用符号链接, 能解析为普通文件就保留原路径, 续签无需再改节点。
     [ -f "$cert_path" ] || { _error "证书文件不存在或链接失效: $cert_path"; return 1; }
     [ -f "$key_path" ] || { _error "私钥文件不存在或链接失效: $key_path"; return 1; }
     openssl x509 -in "$cert_path" -noout >/dev/null 2>&1 || { _error "证书格式无效。"; return 1; }
@@ -6258,7 +4541,7 @@ _refresh_modified_node_artifacts() {
     fi
 
     local uuid password username method sni public_key short_id cert_path key_path skip_verify
-    local path service_name obfs_password hop up down inner_tag shadow_password psk
+    local path service_name obfs_password hop up down inner_tag shadow_password
     case "$variant" in
         vless-reality)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -6271,6 +4554,20 @@ _refresh_modified_node_artifacts() {
                 _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .servername = env(NODE_SNI) | .["reality-opts"]["public-key"] = env(NODE_PUBLIC_KEY) | .["reality-opts"]["short-id"] = env(NODE_SHORT_ID))' || return 1
             fi
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$public_key" "$short_id" "xtls-rprx-vision" || return 1
+            ;;
+        vless-xhttp-reality-enc)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            sni=$(printf '%s' "$node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
+            public_key=$(jq -r --arg tag "$tag" '.[$tag].publicKey // empty' "$METADATA_FILE")
+            short_id=$(printf '%s' "$node" | jq -r '.tls.reality.short_id[0] // empty')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            [ -n "$public_key" ] || { _error "Reality 公钥元数据缺失，无法安全重建客户端配置。"; return 1; }
+            if [ "$yaml_enabled" = "true" ]; then
+                export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_PUBLIC_KEY="$public_key" NODE_SHORT_ID="$short_id" NODE_PATH="$path" NODE_ENC="$enc_key"
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .network = "xhttp" | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .servername = env(NODE_SNI) | .["reality-opts"]["public-key"] = env(NODE_PUBLIC_KEY) | .["reality-opts"]["short-id"] = env(NODE_SHORT_ID) | .["xhttp-opts"].path = env(NODE_PATH) | del(.["xhttp-opts"].mode))' || return 1
+            fi
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$public_key" "$short_id" "$path" "$enc_key" || return 1
             ;;
         vless-ws-tls|vless-grpc-tls)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -6290,6 +4587,36 @@ _refresh_modified_node_artifacts() {
                 _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .servername = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .["grpc-opts"]["grpc-service-name"] = env(NODE_SERVICE))' || return 1
                 _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$sni" "$service_name" "$skip_verify" "$cert_path" || return 1
             fi
+            ;;
+        vless-xhttp-enc-tls)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            sni=$(printf '%s' "$node" | jq -r '.tls.server_name // empty')
+            cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
+            key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            export NODE_UUID="$uuid" NODE_SNI="$sni" NODE_PATH="$path" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .servername = env(NODE_SNI) | ."skip-cert-verify" = false | .port = 443 | .alpn = ["h2"] | .ech = true | .["xhttp-opts"].path = env(NODE_PATH) | del(.["xhttp-opts"].mode) | .["xhttp-opts"].headers.Host = env(NODE_SNI))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "443" "$tag" "$uuid" "$sni" "$path" "false" "$cert_path" "$enc_key" || return 1
+            ;;
+        vless-xhttp-enc)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            path=$(printf '%s' "$node" | jq -r '.transport.path // "/"')
+            host=$(jq -r --arg tag "$tag" '.[$tag].host // empty' "$METADATA_FILE")
+            [ -n "$host" ] || host=$(_get_proxy_field "$name" '.servername // .["xhttp-opts"].headers.Host // ""')
+            [ -n "$host" ] || host="$DEFAULT_SNI"
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            export NODE_UUID="$uuid" NODE_HOST="$host" NODE_PATH="$path" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .port = 443 | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .tls = true | .alpn = ["h2"] | .servername = env(NODE_HOST) | ."skip-cert-verify" = false | .["xhttp-opts"].path = env(NODE_PATH) | del(.["xhttp-opts"].mode) | .["xhttp-opts"].headers.Host = env(NODE_HOST))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "443" "$tag" "$uuid" "$host" "$path" "$enc_key" || return 1
+            ;;
+        vless-enc-tcp)
+            uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
+            enc_key=$(jq -r --arg tag "$tag" '.[$tag].encryption // empty' "$METADATA_FILE")
+            [ -n "$enc_key" ] || { _error "ENC 密钥元数据缺失，无法重建客户端配置。"; return 1; }
+            export NODE_UUID="$uuid" NODE_ENC="$enc_key"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .flow = "xtls-rprx-vision" | .encryption = env(NODE_ENC) | .network = "tcp" | .tls = false | .udp = true)' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$enc_key" || return 1
             ;;
         vless-tcp)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -6379,11 +4706,6 @@ _refresh_modified_node_artifacts() {
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.cipher = env(NODE_METHOD) | .password = env(NODE_PASSWORD) | .["plugin-opts"].host = env(NODE_SNI) | .["plugin-opts"].password = env(NODE_SHADOW_PASSWORD))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$method" "$password" "$shadow_password" "$sni" || return 1
             ;;
-        snell-v6)
-            psk=$(jq -er '.psk' <<< "$node") || return 1
-            export NODE_PSK="$psk"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))).psk = env(NODE_PSK)' || return 1
-            ;;
         socks)
             username=$(printf '%s' "$node" | jq -r '.users[0].username')
             password=$(printf '%s' "$node" | jq -r '.users[0].password')
@@ -6401,6 +4723,8 @@ _refresh_modified_node_artifacts() {
             --arg tag "$tag" --arg sni "${sni:-}" --arg mode "$cert_mode" --arg cert "$cert_path" --arg key "$key_path" --arg sha "$cert_sha" --arg skip "${skip_verify:-false}" || return 1
     elif [ -n "${sni:-}" ]; then
         _atomic_modify_json "$METADATA_FILE" '.[$tag].serverName = $sni' --arg tag "$tag" --arg sni "$sni" || return 1
+    elif [ "$variant" = "vless-xhttp-enc" ] && [ -n "${host:-}" ]; then
+        _atomic_modify_json "$METADATA_FILE" '.[$tag].host = $host' --arg tag "$tag" --arg host "$host" || return 1
     fi
 }
 
@@ -6409,18 +4733,18 @@ _modify_port() (
     local primary_nodes
     primary_nodes=$(_list_main_primary_inbounds)
     if [ -z "$primary_nodes" ]; then
-        _warning "当前没有可由主节点菜单修改的节点（Argo 请在 Argo 菜单管理）。"
+        _warning "当前没有可由主节点菜单修改的节点。"
         return
     fi
-    
+
     _info "--- 修改节点端口 ---"
-    
+
     # 列出所有节点
     local inbound_tags=()
     local inbound_ports=()
     local inbound_types=()
     local display_names=()
-    
+
     local i=1 preset_num=""
     # [资源优化] 合并3次jq为1次 + 使用公共函数 _find_proxy_name 替代内联查找
     local node
@@ -6432,35 +4756,35 @@ _modify_port() (
         inbound_tags+=("$tag")
         inbound_ports+=("$port")
         inbound_types+=("$type")
-        
+
         # [M1] 使用公共函数替代内联重复的代理名查找逻辑
         local proxy_name_to_find=$(_find_proxy_name "$port" "$type" "$tag")
-        
+
         local meta_name=$(jq -r --arg t "$tag" '.[$t].name // empty' "$METADATA_FILE" 2>/dev/null)
         local display_name=${proxy_name_to_find:-${meta_name:-$tag}}
         display_names+=("$display_name")
         [ -n "$preset_tag" ] && [ "$tag" = "$preset_tag" ] && preset_num="$i"
-        
+
         echo -e "  ${CYAN}$i)${NC} ${display_name} (${YELLOW}${type}${NC}) @ ${GREEN}${port}${NC}"
         ((i++))
     done <<< "$primary_nodes"
-    
+
     local num=""
     if [ -n "$preset_tag" ]; then
         [ -n "$preset_num" ] || { _error "指定的节点不存在或不可修改。"; return 1; }
         num="$preset_num"
     else
-        read -p "请输入要修改端口的节点编号 (输入 0 返回): " num
+        read -r -p "请输入要修改端口的节点编号 (输入 0 返回): " num
     fi
-    
+
     [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
-    
+
     local count=${#inbound_tags[@]}
     if [ "$num" -gt "$count" ]; then
         _error "编号超出范围。"
         return
     fi
-    
+
     local index=$((num - 1))
     local tag_to_modify=${inbound_tags[$index]}
     local type_to_modify=${inbound_types[$index]}
@@ -6486,10 +4810,10 @@ _modify_port() (
     local final_hop_info=""
     local final_hop_start=""
     local final_hop_end=""
-    
+
     _info "当前节点: ${display_name_to_modify} (${type_to_modify})"
     _info "当前端口: ${old_port}"
-    
+
     if [ "$type_to_modify" = "hysteria2" ] && [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
         hop_info=$(jq -r ".\"$tag_to_modify\".portHopping // \"\"" "$METADATA_FILE" 2>/dev/null)
         hop_mode=$(jq -r ".\"$tag_to_modify\".portHoppingMode // \"\"" "$METADATA_FILE" 2>/dev/null)
@@ -6501,20 +4825,20 @@ _modify_port() (
             fi
         fi
     fi
-    
-    read -p "请输入新的端口号: " new_port
-    
+
+    read -r -p "请输入新的端口号: " new_port
+
     # 验证端口
     if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
         _error "无效的端口号！"
         return
     fi
-    
+
     if [ "$new_port" -eq "$old_port" ]; then
         _warning "新端口与当前端口相同，无需修改。"
         return
     fi
-    
+
     local listen_proto="tcp"
     [[ "$type_to_modify" == "hysteria2" || "$type_to_modify" == "tuic" ]] && listen_proto="udp"
     [ "$type_to_modify" = "shadowsocks" ] && listen_proto="tcp+udp"
@@ -6531,10 +4855,10 @@ _modify_port() (
             return
         fi
     fi
-    
+
     if [ -n "$hop_info" ]; then
         _info "检测到当前 HY2 节点启用了端口跳跃 (${hop_mode:-unknown}): ${hop_info}"
-        read -p "请输入新的端口跳跃范围（直接回车保留原范围，输入 none 关闭）: " hop_range_input
+        read -r -p "请输入新的端口跳跃范围（直接回车保留原范围，输入 none 关闭）: " hop_range_input
         if [ -z "$hop_range_input" ]; then
             final_hop_info="$hop_info"
         elif [ "$hop_range_input" = "none" ]; then
@@ -6571,7 +4895,7 @@ _modify_port() (
             final_hop_info="$hop_range_input"
         fi
     fi
-    
+
     if [ -n "$final_hop_info" ]; then
         final_hop_start="${final_hop_info%-*}"
         final_hop_end="${final_hop_info#*-}"
@@ -6622,7 +4946,7 @@ _modify_port() (
         _error "目标节点的类型、旧端口或 detour 在选择后已变化，请重新操作。"
         return 1
     fi
-    _is_argo_inbound_tag "$tag_to_modify" && { _error "目标已变为 Argo 受保护节点，拒绝修改。"; return 1; }
+    _is_argo_inbound_tag "$tag_to_modify" && { _error "目标已变为 Argo 节点，请返回重进修改菜单走 Argo 修改。"; return 1; }
     [[ "$tag_to_modify" == *"-hop-"* ]] && { _error "端口跳跃辅助节点不能单独修改。"; return 1; }
     _is_shadowtls_inner_tag "$tag_to_modify" && { _error "ShadowTLS 内层节点不能单独修改。"; return 1; }
     if [ "$type_to_modify" = "shadowtls" ]; then
@@ -6671,7 +4995,7 @@ _modify_port() (
     fi
 
     local proposed_new_tag proposed_new_inner proposed_old_proxy_name proposed_new_proxy_name
-    proposed_new_tag=$(echo "$tag_to_modify" | sed "s/${old_port}/${new_port}/g")
+    proposed_new_tag=$(echo "$tag_to_modify" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
     if [ "$proposed_new_tag" != "$tag_to_modify" ] && jq -e --arg tag "$proposed_new_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
         _error "新 tag 已被其他节点占用: $proposed_new_tag"
         return 1
@@ -6684,7 +5008,7 @@ _modify_port() (
         if [[ "$shadowtls_inner_tag" == "$tag_to_modify"* ]]; then
             proposed_new_inner="${proposed_new_tag}${shadowtls_inner_tag#${tag_to_modify}}"
         else
-            proposed_new_inner=$(echo "$shadowtls_inner_tag" | sed "s/${old_port}/${new_port}/g")
+            proposed_new_inner=$(echo "$shadowtls_inner_tag" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
         fi
         if [ "$proposed_new_inner" != "$shadowtls_inner_tag" ] && jq -e --arg tag "$proposed_new_inner" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
             _error "新的 ShadowTLS 内层 tag 已被占用: $proposed_new_inner"
@@ -6721,7 +5045,7 @@ _modify_port() (
             _error "该 Clash 节点名仍被 Argo/Xray/中转共享引用，拒绝原地改名或改端口: $proposed_old_proxy_name"
             return 1
         fi
-        proposed_new_proxy_name=$(echo "$proposed_old_proxy_name" | sed "s/${old_port}/${new_port}/g")
+        proposed_new_proxy_name=$(echo "$proposed_old_proxy_name" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
         if [ "$proposed_new_proxy_name" != "$proposed_old_proxy_name" ]; then
             export PROXY_NAME="$proposed_new_proxy_name"
             if ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | .name' "$CLASH_YAML_FILE" 2>/dev/null | grep -Fxq "$proposed_new_proxy_name"; then
@@ -6744,67 +5068,65 @@ _modify_port() (
             return 1
         fi
     fi
-    
+
     _info "正在修改端口: ${old_port} -> ${new_port}"
-    
+
     # 1. 修改 config.json 主节点端口（按 tag 精确匹配，避免过滤 hop 子节点后索引错位）
-    _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$tag_to_modify\") | .listen_port) = $new_port" || return
-    
+    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .listen_port) = $port' --arg tag "$tag_to_modify" --argjson port "$new_port" || return
+
     # 2. 修改 clash.yaml (全链路同步模式)
     local old_proxy_name="$proposed_old_proxy_name"
     if [ -n "$old_proxy_name" ]; then
         # 生成新名字：将名字中的旧端口替换为新端口
         local new_proxy_name="$proposed_new_proxy_name"
-        
+
         export OLD_NAME="$old_proxy_name"
         export NEW_NAME="$new_proxy_name"
         export NEW_PORT_VAL="$new_port"
-        
+
         # 原子改名与改端口
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .name) = env(NEW_NAME)' || return 1
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME)) | .port) = (env(NEW_PORT_VAL)|tonumber)' || return 1
-        
-        # 全局同步更新所有分组中的引用
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)' || return 1
-        
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '
+            (.proxies[] | select(.name == env(OLD_NAME))) |= (.name = env(NEW_NAME) | .port = (env(NEW_PORT_VAL) | tonumber))
+            | (.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)
+        ' || return 1
+
         if [ -n "$final_hop_info" ]; then
             export NEW_PORTS_VAL="$final_hop_info"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME)) | .ports) = env(NEW_PORTS_VAL)' || return 1
         elif [ -n "$hop_info" ]; then
             _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .ports)' || return 1
         fi
-        
+
         _info "Clash 节点名同步: ${old_proxy_name} -> ${new_proxy_name}"
     fi
-    
-    # 3. 同步更新元数据中的备注名与 HY2 跳跃状态。分享链接在所有
-    # 服务端、YAML 和 tag 变更完成后由统一构建器重新生成。
+
+    # 分享链接在服务端、YAML 和 tag 变更完成后由统一构建器重新生成。
     if [ -f "$METADATA_FILE" ]; then
         if jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
             local current_meta_name
             current_meta_name=$(jq -r ".\"$tag_to_modify\".name // \"\"" "$METADATA_FILE")
             if [ -n "$current_meta_name" ]; then
                 local new_meta_name
-                new_meta_name=$(echo "$current_meta_name" | sed "s/${old_port}/${new_port}/g")
+                new_meta_name=$(echo "$current_meta_name" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
                 if [ "$new_meta_name" != "$current_meta_name" ]; then
-                    _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".name = \"$new_meta_name\"" || return
+                    _atomic_modify_json "$METADATA_FILE" '.[$tag].name = $name' --arg tag "$tag_to_modify" --arg name "$new_meta_name" || return
                 fi
             fi
             if [ -n "$hop_info" ]; then
                 if [ -n "$final_hop_info" ]; then
-                    _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".portHopping = \"$final_hop_info\"" || return
+                    _atomic_modify_json "$METADATA_FILE" '.[$tag].portHopping = $hop' --arg tag "$tag_to_modify" --arg hop "$final_hop_info" || return
                     if [ -n "$hop_mode" ]; then
-                        _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".portHoppingMode = \"$hop_mode\"" || return
+                        _atomic_modify_json "$METADATA_FILE" '.[$tag].portHoppingMode = $mode' --arg tag "$tag_to_modify" --arg mode "$hop_mode" || return
                     fi
                 else
-                    _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_modify\".portHopping, .\"$tag_to_modify\".portHoppingMode)" || return
+                    _atomic_modify_json "$METADATA_FILE" 'del(.[$tag].portHopping, .[$tag].portHoppingMode)' --arg tag "$tag_to_modify" || return
                 fi
             fi
         fi
     fi
 
     # 4. 通用 tag 重命名（所有含端口的 tag 都可能需要更新）
-    local new_tag=$(echo "$tag_to_modify" | sed "s/${old_port}/${new_port}/g")
+    local new_tag=$(echo "$tag_to_modify" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
     if [ "$new_tag" != "$tag_to_modify" ]; then
         # 4a. 处理证书文件重命名（仅 Hysteria2, TUIC, AnyTLS 有独立证书）
         if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ] || [ "$type_to_modify" == "anytls" ]; then
@@ -6815,18 +5137,18 @@ _modify_port() (
             if [ -f "$old_cert" ] && [ -f "$old_key" ]; then
                 mv -- "$old_cert" "$new_cert" || return 1
                 mv -- "$old_key" "$new_key" || return 1
-                _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$tag_to_modify\") | .tls.certificate_path) = \"$new_cert\"" || return
-                _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$tag_to_modify\") | .tls.key_path) = \"$new_key\"" || return
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.certificate_path) = $cert' --arg tag "$tag_to_modify" --arg cert "$new_cert" || return
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.key_path) = $key' --arg tag "$tag_to_modify" --arg key "$new_key" || return
             fi
         fi
-        
+
         # 4b. 更新 config.json 中主节点的 tag；ShadowTLS 同步迁移内层 tag 和 detour。
         local new_shadowtls_inner_tag="$shadowtls_inner_tag"
         if [ "$type_to_modify" = "shadowtls" ]; then
             if [[ "$shadowtls_inner_tag" == "$tag_to_modify"* ]]; then
                 new_shadowtls_inner_tag="${new_tag}${shadowtls_inner_tag#${tag_to_modify}}"
             else
-                new_shadowtls_inner_tag=$(echo "$shadowtls_inner_tag" | sed "s/${old_port}/${new_port}/g")
+                new_shadowtls_inner_tag=$(echo "$shadowtls_inner_tag" | sed -E "s/(^|[-_ ])${old_port}$/\1${new_port}/")
             fi
             _atomic_modify_json "$CONFIG_FILE" '
                 (.inbounds[] | select(.tag == $outer) | .tag) = $new_outer
@@ -6853,7 +5175,7 @@ _modify_port() (
             ' \
                 --arg old "$tag_to_modify" --arg new "$new_tag" || return
         fi
-        
+
         # 4c. 迁移 metadata.json 中的 key (旧tag -> 新tag)
         if [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
             local meta_content=$(jq --arg tag "$tag_to_modify" '.[$tag]' "$METADATA_FILE")
@@ -6863,10 +5185,10 @@ _modify_port() (
             _atomic_modify_json "$METADATA_FILE" 'del(.[$old]) | . + {($new):$meta}' \
                 --arg old "$tag_to_modify" --arg new "$new_tag" --argjson meta "$meta_content" || return
         fi
-        
+
         _info "Tag 同步: ${tag_to_modify} -> ${new_tag}"
     fi
-    
+
     # 5. 联动更新端口跳跃规则
     local final_tag="${new_tag:-$tag_to_modify}"
     if [ -n "$hop_info" ]; then
@@ -6913,9 +5235,9 @@ _modify_port() (
                 _info "已移除端口跳跃映射。"
             fi
         elif [ "$hop_mode" = "native" ]; then
-            _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"${tag_to_modify}-hop-\") | not))" || return
+            _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(select(((.tag // "") | startswith($prefix)) | not))' --arg prefix "${tag_to_modify}-hop-" || return
             if [ -n "$new_tag" ] && [ "$new_tag" != "$tag_to_modify" ]; then
-                _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"${new_tag}-hop-\") | not))" || return
+                _atomic_modify_json "$CONFIG_FILE" '.inbounds |= map(select(((.tag // "") | startswith($prefix)) | not))' --arg prefix "${new_tag}-hop-" || return
             fi
             if [ -n "$final_hop_info" ]; then
                 local cert_path="${SINGBOX_DIR}/${final_tag}.pem"
@@ -6923,20 +5245,21 @@ _modify_port() (
                 local hy2_password=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .users[0].password // ""' "$CONFIG_FILE")
                 local hy2_obfs_password=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .obfs.password // ""' "$CONFIG_FILE")
                 local batch_array="[]"
-                local skipped=0
+                local skipped=0 hop_ports=""
                 local p
                 for ((p=final_hop_start; p<=final_hop_end; p++)); do
                     if [ "$p" -eq "$new_port" ]; then continue; fi
                     local skip_live="false"
                     if [ "$p" -ge "${hop_info%-*}" ] && [ "$p" -le "${hop_info#*-}" ]; then skip_live="true"; fi
-                    # metadata key 已在上方迁移为 final_tag；排除旧 tag 会把节点
-                    # 自己的跳跃范围误判为冲突，导致所有原生子入站被跳过。
+                    # metadata key 已迁移为 final_tag, 排除旧 tag 会把节点自己的跳跃范围误判为冲突。
                     if _check_port_conflict "$p" "udp" "true" "$final_tag" "$skip_live"; then ((skipped++)); continue; fi
-                    local hop_tag="${final_tag}-hop-${p}"
-                    batch_array=$(echo "$batch_array" | jq --arg t "$hop_tag" --arg p "$p" --arg pw "$hy2_password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$hy2_obfs_password" '. += [{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end]')
+                    hop_ports="$hop_ports $p"
                 done
+                if [ -n "$hop_ports" ]; then
+                    batch_array=$(jq -cn --arg t "$final_tag" --arg pw "$hy2_password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$hy2_obfs_password" --arg ports "$hop_ports" '($ports | split(" ") | map(select(. != "") | tonumber)) as $ps | [ $ps[] | {type:"hysteria2",tag:($t + "-hop-" + (. | tostring)),listen:"::",listen_port:.,users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end ]') || return
+                fi
                 if [ "$(echo "$batch_array" | jq 'length')" -gt 0 ]; then
-                    _atomic_modify_json "$CONFIG_FILE" ".inbounds += $batch_array" || return
+                    _atomic_modify_json "$CONFIG_FILE" '.inbounds += $batch' --argjson batch "$batch_array" || return
                 fi
                 _info "已重建原生端口跳跃子节点，范围: ${final_hop_info}"
                 if [ "$skipped" -gt 0 ]; then
@@ -6948,11 +5271,10 @@ _modify_port() (
         fi
     fi
 
-    # 不再对旧链接做字符串替换；从最终配置和元数据完整重建，避免端口数字
-    # 误伤密码/UUID，也确保证书指纹、SNI、认证信息与 HY2 跳跃参数一致。
+    # 不再对旧链接做字符串替换, 从最终配置和元数据完整重建, 避免端口数字误伤密码/UUID。
     local final_proxy_name="${proposed_new_proxy_name:-$proposed_old_proxy_name}"
     _refresh_modified_node_artifacts "$final_tag" "$final_proxy_name" || return 1
-    
+
     local modify_check_result
     if ! modify_check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
         _error "端口修改后的组合配置校验失败："
@@ -6974,6 +5296,39 @@ _modify_port() (
     fi
     _success "端口修改成功: ${old_port} -> ${new_port}"
 )
+
+# Argo 只重建分享链接并同步 YAML 路径, 服务器与端口永远是域名:443。
+_refresh_argo_node_artifacts() {
+    local tag="$1" old_proxy_name="$2"
+    local argo_meta name domain uuid enc path protocol proxy_name
+    argo_meta=$(jq -c --arg tag "$tag" '.[$tag] // {}' "$ARGO_METADATA_FILE" 2>/dev/null) || return 1
+    [ "$argo_meta" != "{}" ] || { _error "Argo 元数据缺失，无法重建分享链接。"; return 1; }
+    name=$(printf '%s' "$argo_meta" | jq -r '.name // empty')
+    domain=$(printf '%s' "$argo_meta" | jq -r '.domain // empty')
+    uuid=$(printf '%s' "$argo_meta" | jq -r '.uuid // empty')
+    enc=$(printf '%s' "$argo_meta" | jq -r '.encryption // empty')
+    path=$(printf '%s' "$argo_meta" | jq -r '.path // empty')
+    protocol=$(printf '%s' "$argo_meta" | jq -r '.protocol // empty')
+    [ -n "$name" ] && [ -n "$domain" ] && [ -n "$uuid" ] || { _error "Argo 元数据不完整，无法重建分享链接。"; return 1; }
+    proxy_name="$name"
+    [ -n "$proxy_name" ] || proxy_name="$old_proxy_name"
+    if [ -n "$proxy_name" ] && [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ]; then
+        export OLD_NAME="$proxy_name" NODE_PATH="$path"
+        if [ "$protocol" = "vless-xhttp-enc" ]; then
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .["xhttp-opts"].path) = env(NODE_PATH)' || return 1
+        elif [ "$protocol" = "vless-ws-enc" ]; then
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .["ws-opts"].path) = env(NODE_PATH)' || return 1
+        fi
+    fi
+    if [ "$protocol" = "vless-xhttp-enc" ]; then
+        _show_node_link "vless-xhttp-argo" "$name" "$domain" "443" "$tag" "$uuid" "$path" "$enc" || return 1
+    elif [ "$protocol" = "vless-ws-enc" ]; then
+        _show_node_link "vless-ws-enc-argo" "$name" "$domain" "443" "$tag" "$uuid" "$path" "$enc" || return 1
+    else
+        _error "未知的 Argo 协议: $protocol"
+        return 1
+    fi
+}
 
 _modify_node_apply() (
     local tag="$1" expected_node="$2" expected_metadata="$3" old_proxy_name="$4" action="$5"
@@ -7007,7 +5362,19 @@ _modify_node_apply() (
     trap 'exit 143' TERM
 
     _validate_protected_yaml_metadata || return 1
-    _is_argo_inbound_tag "$tag" && { _error "Argo 节点只能在 Argo 菜单修改。"; return 1; }
+    # Argo 节点只允许 argo_port/argo_domain/argo_token/argo_path 四种动作。
+    local is_argo=0
+    _is_argo_inbound_tag "$tag" && is_argo=1
+    if [ "$is_argo" -eq 1 ]; then
+        case "$action" in
+            argo_port|argo_domain|argo_token|argo_path) ;;
+            *) _error "Argo 节点只支持修改本地端口/域名/Token/传输路径。"; return 1 ;;
+        esac
+        local expected_argo="${arg2:-}"
+        local current_argo
+        current_argo=$(jq -cS --arg tag "$tag" '.[$tag] // {}' "$ARGO_METADATA_FILE" 2>/dev/null) || return 1
+        [ "$current_argo" = "$expected_argo" ] || { _error "Argo 元数据在选择后已被其他操作修改，请重新进入菜单。"; return 1; }
+    fi
     [[ "$tag" == *"-hop-"* ]] && { _error "HY2 跳跃辅助入站不能单独修改。"; return 1; }
     _is_shadowtls_inner_tag "$tag" && { _error "ShadowTLS 内层不能单独修改。"; return 1; }
 
@@ -7055,9 +5422,6 @@ _modify_node_apply() (
                         | (.inbounds[] | select(.tag == $inner) | .password) = $inner_password
                     ' --arg tag "$tag" --arg inner "$inner_tag" --arg outer "$arg1" --arg inner_password "$arg2" || return 1
                     ;;
-                snell-v6)
-                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag)).psk = $psk' --arg tag "$tag" --arg psk "$arg1" || return 1
-                    ;;
                 socks)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.username = $username | .password = $password)' --arg tag "$tag" --arg username "$arg1" --arg password "$arg2" || return 1 ;;
             esac
@@ -7065,7 +5429,7 @@ _modify_node_apply() (
             ;;
         identity)
             case "$variant" in
-                vless-reality|any-reality)
+                vless-reality|vless-xhttp-reality-enc|any-reality)
                     _atomic_modify_json "$CONFIG_FILE" '
                         (.inbounds[] | select(.tag == $tag) | .tls.server_name) = $sni
                         | (.inbounds[] | select(.tag == $tag) | .tls.reality.handshake.server) = $sni
@@ -7074,7 +5438,14 @@ _modify_node_apply() (
                 shadowsocks-shadowtls)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .handshake.server) = $sni' --arg tag "$tag" --arg sni "$arg1" || return 1
                     ;;
-                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
+                    vless-xhttp-enc)
+                    _atomic_modify_json "$METADATA_FILE" '.[$tag].host = $host' --arg tag "$tag" --arg host "$arg1" || return 1
+                    if [ -n "$old_proxy_name" ]; then
+                        export OLD_NAME="$old_proxy_name" NODE_HOST="$arg1"
+                        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME))) |= (.servername = env(NODE_HOST) | .["xhttp-opts"].headers.Host = env(NODE_HOST))' || return 1
+                    fi
+                    ;;
+                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic|vless-xhttp-enc-tls)
                     local cert_path key_path skip_verify
                     if [ "$arg2" = "self_signed" ]; then
                         cert_path="${SINGBOX_DIR}/${tag}.pem"
@@ -7101,7 +5472,7 @@ _modify_node_apply() (
             ;;
         transport)
             case "$variant" in
-                vless-ws-tls|trojan-ws-tls)
+                vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc|vless-xhttp-reality-enc)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.path) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 vless-grpc-tls)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.service_name) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
@@ -7110,7 +5481,7 @@ _modify_node_apply() (
             restart_needed=1
             ;;
         reality_keys)
-            [[ "$variant" == "vless-reality" || "$variant" == "any-reality" ]] || return 1
+            [[ "$variant" == "vless-reality" || "$variant" == "vless-xhttp-reality-enc" || "$variant" == "any-reality" ]] || return 1
             local keypair private_key public_key short_id
             keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
             private_key=$(printf '%s\n' "$keypair" | awk '/PrivateKey/ {print $2; exit}')
@@ -7122,6 +5493,21 @@ _modify_node_apply() (
                 | (.inbounds[] | select(.tag == $tag) | .tls.reality.short_id) = [$sid]
             ' --arg tag "$tag" --arg private "$private_key" --arg sid "$short_id" || return 1
             _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {publicKey:$public,shortId:$sid})' --arg tag "$tag" --arg public "$public_key" --arg sid "$short_id" || return 1
+            restart_needed=1
+            ;;
+        enc_keys)
+            [ "$variant" = "vless-enc-tcp" ] || return 1
+            local keypair private_key public_key
+            keypair=$(${SINGBOX_BIN} generate reality-keypair) || return 1
+            private_key=$(echo "$keypair" | grep -iE 'private[[:space:]]*key' | awk '{print $NF}')
+            public_key=$(echo "$keypair" | grep -iE 'public[[:space:]]*key' | awk '{print $NF}')
+            [ -n "$private_key" ] && [ -n "$public_key" ] || { _error "ENC 密钥生成失败。"; return 1; }
+            local server_decryption="mlkem768x25519plus.native.600s.${private_key}"
+            local client_encryption="mlkem768x25519plus.native.0rtt.${public_key}"
+            _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .decryption) = $dec' \
+                --arg tag "$tag" --arg dec "$server_decryption" || return 1
+            _atomic_modify_json "$METADATA_FILE" '.[$tag] |= (. + {encryption:$enc, decryption:$dec, publicKey:$pk, privateKey:$sk})' \
+                --arg tag "$tag" --arg enc "$client_encryption" --arg dec "$server_decryption" --arg pk "$public_key" --arg sk "$private_key" || return 1
             restart_needed=1
             ;;
         hy2_obfs)
@@ -7164,7 +5550,7 @@ _modify_node_apply() (
                 else
                     _nft_delete_rules_by_comment "singboxlite-hy2-hop-${tag}" >/dev/null 2>&1 || true
                     [ "$count" -le 1000 ] || { _error "当前环境不能使用 nftables，原生跳跃最多允许 1000 个端口。"; return 1; }
-                    local main_node password obfs_password cert_path key_path batch_array="[]" p hop_tag
+                    local main_node password obfs_password cert_path key_path batch_array="[]" p hop_tag hop_ports=""
                     main_node=$(jq -c --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE")
                     password=$(printf '%s' "$main_node" | jq -r '.users[0].password')
                     obfs_password=$(printf '%s' "$main_node" | jq -r '.obfs.password // empty')
@@ -7172,10 +5558,16 @@ _modify_node_apply() (
                     key_path=$(printf '%s' "$main_node" | jq -r '.tls.key_path')
                     for ((p=start; p<=end; p++)); do
                         [ "$p" -eq "$port" ] && continue
-                        _check_port_conflict "$p" "udp" "true" "$tag" && continue
-                        hop_tag="${tag}-hop-${p}"
-                        batch_array=$(printf '%s' "$batch_array" | jq --arg t "$hop_tag" --argjson p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" '. += [{type:"hysteria2",tag:$t,listen:"::",listen_port:$p,users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end]') || return 1
+                        local skip_live="false"
+                        if [ -n "$old_hop" ] && [ "$p" -ge "${old_hop%-*}" ] && [ "$p" -le "${old_hop#*-}" ]; then
+                            skip_live="true"
+                        fi
+                        _check_port_conflict "$p" "udp" "true" "$tag" "$skip_live" && continue
+                        hop_ports="$hop_ports $p"
                     done
+                    if [ -n "$hop_ports" ]; then
+                        batch_array=$(jq -cn --arg t "$tag" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" --arg ports "$hop_ports" '($ports | split(" ") | map(select(. != "") | tonumber)) as $ps | [ $ps[] | {type:"hysteria2",tag:($t + "-hop-" + (. | tostring)),listen:"::",listen_port:.,users:[{password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}} | if $op != "" then .obfs={type:"salamander",password:$op} else . end ]') || return 1
+                    fi
                     _atomic_modify_json "$CONFIG_FILE" '.inbounds += $nodes' --argjson nodes "$batch_array" || return 1
                     new_mode="native"
                 fi
@@ -7184,6 +5576,85 @@ _modify_node_apply() (
                 [ "$old_mode" != "nftables" ] || _save_nftables_rules || return 1
                 _atomic_modify_json "$METADATA_FILE" 'del(.[$tag].portHopping, .[$tag].portHoppingMode)' --arg tag "$tag" || return 1
             fi
+            restart_needed=1
+            ;;
+        argo_port)
+            local new_port="$arg1" new_tag new_cf_tag old_cf_tag
+            [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1024 ] && [ "$new_port" -le 65535 ] || { _error "端口无效，应为 1024-65535。"; return 1; }
+            [ "$new_port" != "$port" ] || { _error "端口未变。"; return 1; }
+            if _check_port_conflict "$new_port" "tcp" "false" "$tag"; then _error "新端口已被占用。"; return 1; fi
+            new_tag="${tag%-${port}}-${new_port}"
+            new_cf_tag="argo-cf-${new_port}"
+            old_cf_tag=$(_argo_cf_tag "$port") || return 1
+            if jq -e --arg tag "$new_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then _error "新 tag 已被占用: $new_tag"; return 1; fi
+            if jq -e --arg tag "$new_cf_tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then _error "新 cloudflared tag 已被占用: $new_cf_tag"; return 1; fi
+            if jq -e --arg tag "$new_tag" 'has($tag)' "$ARGO_METADATA_FILE" >/dev/null 2>&1; then _error "新 tag 已被 Argo 元数据占用: $new_tag"; return 1; fi
+            _atomic_modify_json "$CONFIG_FILE" '
+                .inbounds |= map(
+                    if .tag == $tag then (.tag = $new | .listen_port = $port)
+                    elif .tag == $cf then .tag = $new_cf
+                    else . end)
+            ' --arg tag "$tag" --arg new "$new_tag" --argjson port "$new_port" --arg cf "$old_cf_tag" --arg new_cf "$new_cf_tag" || return 1
+            _atomic_modify_json "$ARGO_METADATA_FILE" '
+                . + {($new): ((.[$old] // {}) + {local_port:$port})}
+                | del(.[$old])
+            ' --arg old "$tag" --arg new "$new_tag" --argjson port "$new_port" || return 1
+            # 证书按旧 tag 命名（仅 vless-xhttp-enc 有自签证书），改端口时跟着迁，否则删节点会按新 tag 删错文件。
+            local old_cert="${SINGBOX_DIR}/${tag}.pem" old_key="${SINGBOX_DIR}/${tag}.key"
+            local new_cert="${SINGBOX_DIR}/${new_tag}.pem" new_key="${SINGBOX_DIR}/${new_tag}.key"
+            local old_cert_present=0 old_key_present=0
+            { [ -e "$old_cert" ] || [ -L "$old_cert" ]; } && old_cert_present=1
+            { [ -e "$old_key" ] || [ -L "$old_key" ]; } && old_key_present=1
+            if [ "$old_cert_present" -ne "$old_key_present" ]; then
+                _error "旧证书与私钥不成对，拒绝修改端口。"
+                return 1
+            fi
+            if [ "$old_cert_present" -eq 1 ]; then
+                if [ -e "$new_cert" ] || [ -L "$new_cert" ] || [ -e "$new_key" ] || [ -L "$new_key" ]; then
+                    _error "新 tag 对应的证书或私钥路径已存在，拒绝覆盖。"
+                    return 1
+                fi
+                mv -- "$old_cert" "$new_cert" || return 1
+                mv -- "$old_key" "$new_key" || return 1
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.certificate_path) = $cert' --arg tag "$new_tag" --arg cert "$new_cert" || return 1
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .tls.key_path) = $key' --arg tag "$new_tag" --arg key "$new_key" || return 1
+            fi
+            # 代理名里带旧端口时跟着改名 (默认名 Argo-XHTTP-<端口>), YAML 端口保持 443 不动。
+            if [ -n "$old_proxy_name" ]; then
+                local new_name
+                new_name=$(printf '%s' "$old_proxy_name" | sed -E "s/(^|[-_ ])${port}$/\1${new_port}/")
+                if [ "$new_name" != "$old_proxy_name" ]; then
+                    _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].name = $name' --arg tag "$new_tag" --arg name "$new_name" || return 1
+                    export OLD_NAME="$old_proxy_name" NEW_NAME="$new_name"
+                    _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .name) = env(NEW_NAME)' || return 1
+                    _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)' || return 1
+                fi
+            fi
+            tag="$new_tag"
+            restart_needed=1
+            ;;
+        argo_domain)
+            local new_domain="$arg1" argo_name
+            [[ "$new_domain" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$new_domain" == *.* ]] || { _error "域名格式无效。"; return 1; }
+            _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].domain = $domain' --arg tag "$tag" --arg domain "$new_domain" || return 1
+            argo_name=$(jq -r --arg tag "$tag" '.[$tag].name // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
+            [ -n "$argo_name" ] && _sync_argo_domain_to_yaml "$argo_name" "$new_domain"
+            restart_needed=0
+            ;;
+        argo_token)
+            local new_token="$arg1" old_cf_tag
+            _argo_token_is_valid "$new_token" || { _error "Token 格式无效。"; return 1; }
+            old_cf_tag=$(_argo_cf_tag "$port") || return 1
+            _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $cf) | .token) = $token' --arg cf "$old_cf_tag" --arg token "$new_token" || return 1
+            _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].token = $token' --arg tag "$tag" --arg token "$new_token" || return 1
+            restart_needed=1
+            ;;
+        argo_path)
+            local new_path="$arg1"
+            [ -n "$new_path" ] || { _error "路径不能为空。"; return 1; }
+            [[ "$new_path" == /* ]] || new_path="/${new_path}"
+            _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .transport.path) = $value' --arg tag "$tag" --arg value "$new_path" || return 1
+            _atomic_modify_json "$ARGO_METADATA_FILE" '.[$tag].path = $value' --arg tag "$tag" --arg value "$new_path" || return 1
             restart_needed=1
             ;;
         *) _error "未知节点修改动作。"; return 1 ;;
@@ -7209,7 +5680,12 @@ _modify_node_apply() (
         ' --arg prefix "${tag}-hop-" --arg password "$hy2_password" --arg obfs "$hy2_obfs" --arg cert "$cert_after" --arg key "$key_after" --arg sni "$sni_after" || return 1
     fi
 
-    _refresh_modified_node_artifacts "$tag" "$old_proxy_name" || return 1
+    # Argo 节点走专用产物重建, 通用重建会把 YAML 端口错写成本地端口。
+    if [ "$is_argo" -eq 1 ]; then
+        _refresh_argo_node_artifacts "$tag" "$old_proxy_name" || return 1
+    else
+        _refresh_modified_node_artifacts "$tag" "$old_proxy_name" || return 1
+    fi
     local check_result
     if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
         _error "节点修改后的组合配置校验失败："
@@ -7233,6 +5709,62 @@ _confirm_node_change() {
     read -r -p "确认保存并应用本次修改？[Y/n]: " confirm
     [[ "$confirm" =~ ^[Nn]$ ]] && return 1
     _modify_node_apply "$@"
+}
+
+_modify_argo_node() {
+    local tag="$1" expected_node="$2" proxy_name="$3" display_name="$4" port="$5"
+    local argo_meta name domain path protocol choice value
+    argo_meta=$(jq -cS --arg tag "$tag" '.[$tag] // {}' "$ARGO_METADATA_FILE" 2>/dev/null) || return 1
+    [ "$argo_meta" != "{}" ] || { _error "Argo 元数据缺失，无法修改。"; return 1; }
+    name=$(printf '%s' "$argo_meta" | jq -r '.name // empty')
+    domain=$(printf '%s' "$argo_meta" | jq -r '.domain // empty')
+    path=$(printf '%s' "$argo_meta" | jq -r '.path // empty')
+    protocol=$(printf '%s' "$argo_meta" | jq -r '.protocol // empty')
+    echo ""
+    _info "当前节点: ${display_name} (Argo ${protocol})"
+    echo "  本地端口: ${port} | 域名: ${domain} | 路径: ${path}"
+    echo "  1) 修改本地端口"
+    echo "  2) 修改 Argo 域名"
+    echo "  3) 修改 Argo Token"
+    echo "  4) 修改传输路径 (Path)"
+    echo "  0) 返回"
+    read -r -p "请选择修改项: " choice
+    case "$choice" in
+        1)
+            read -r -p "请输入新本地端口 (当前: ${port}): " value
+            [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1024 ] && [ "$value" -le 65535 ] || { _error "端口无效，应为 1024-65535。"; return 1; }
+            [ "$value" != "$port" ] || { _info "端口未变。"; return; }
+            if _check_port_conflict "$value" "tcp" "false" "$tag"; then _error "端口 ${value} 已被占用。"; return 1; fi
+            _info "本地端口: ${port} -> ${value}"
+            _confirm_node_change "$tag" "$expected_node" "{}" "$proxy_name" argo_port "$value" "$argo_meta"
+            ;;
+        2)
+            read -r -p "请输入新 Argo 域名 (当前: ${domain}): " value
+            value=$(_normalize_client_server "$value")
+            [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$value" == *.* ]] || { _error "域名格式无效。"; return 1; }
+            [ "$value" != "$domain" ] || { _info "域名未变。"; return; }
+            _info "Argo 域名: ${domain} -> ${value} (Zero Trust 里 Public Hostname 也要改成这个, 否则隧道不通)"
+            _confirm_node_change "$tag" "$expected_node" "{}" "$proxy_name" argo_domain "$value" "$argo_meta"
+            ;;
+        3)
+            _warn "Token 换错了 sing-box 启动会失败，全部节点一起停；重启失败时脚本会自动回滚。"
+            read -r -p "请输入新 Token (可直接粘贴整条 cloudflared tunnel run 命令): " value
+            value=$(_argo_extract_token "$value")
+            [ -n "$value" ] && _argo_token_is_valid "$value" || { _error "Token 格式无效: 应为 Zero Trust 后台的 Base64 token (eyJ 开头)。"; return 1; }
+            _info "Argo Token: 已更换 (不显示明文)"
+            _confirm_node_change "$tag" "$expected_node" "{}" "$proxy_name" argo_token "$value" "$argo_meta"
+            ;;
+        4)
+            read -r -p "请输入新传输路径 (当前: ${path}): " value
+            [ -n "$value" ] || { _error "路径不能为空。"; return 1; }
+            [[ "$value" == /* ]] || value="/${value}"
+            [ "$value" != "$path" ] || { _info "路径未变。"; return; }
+            _info "传输路径: ${path} -> ${value}"
+            _confirm_node_change "$tag" "$expected_node" "{}" "$proxy_name" argo_path "$value" "$argo_meta"
+            ;;
+        0) return ;;
+        *) _error "无效输入，请重试。"; return 1 ;;
+    esac
 }
 
 _modify_node() {
@@ -7263,6 +5795,11 @@ _modify_node() {
     expected_node=$(jq -cS --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE") || return 1
     expected_metadata=$(jq -cS --arg tag "$tag" '.[$tag] // {}' "$METADATA_FILE") || return 1
 
+    if _is_argo_inbound_tag "$tag"; then
+        _modify_argo_node "$tag" "$expected_node" "$proxy_name" "$display_name" "$port"
+        return $?
+    fi
+
     echo ""
     _info "当前节点: ${display_name} (${variant})"
     echo "  1) 修改节点名称"
@@ -7272,16 +5809,18 @@ _modify_node() {
         tuic) echo "  4) 修改 UUID 和密码" ;;
         shadowsocks-shadowtls) echo "  4) 修改 ShadowTLS 与内部 SS 密码" ;;
         socks) echo "  4) 修改用户名和密码" ;;
-        snell-v6) echo "  4) 重新生成 PSK" ;;
         *) echo "  4) 修改认证信息" ;;
     esac
     case "$variant" in
-        vless-reality|any-reality|shadowsocks-shadowtls) echo "  5) 修改伪装域名/SNI" ;;
-        vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic) echo "  5) 修改 SNI 与证书" ;;
+        vless-reality|vless-xhttp-reality-enc|any-reality|shadowsocks-shadowtls) echo "  5) 修改伪装域名/SNI" ;;
+        vless-xhttp-enc) echo "  5) 修改 CF 回源域名(Host/SNI)" ;;
+        vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic|vless-xhttp-enc-tls) echo "  5) 修改 SNI 与证书" ;;
     esac
     case "$variant" in
         vless-reality|any-reality) echo "  6) 重新生成 Reality 密钥和 Short ID" ;;
-        vless-ws-tls|trojan-ws-tls) echo "  6) 修改 WebSocket 路径" ;;
+        vless-enc-tcp) echo "  6) 重新生成 ENC 密钥对" ;;
+        vless-xhttp-reality-enc) echo "  6) 修改传输路径 (Path)"; echo "  7) 重新生成 Reality 密钥和 Short ID" ;;
+        vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc) echo "  6) 修改传输路径 (Path)" ;;
         vless-grpc-tls) echo "  6) 修改 gRPC serviceName" ;;
         hysteria2) echo "  6) 修改 Salamander 混淆"; echo "  7) 修改端口跳跃"; echo "  8) 修改客户端带宽参数" ;;
     esac
@@ -7329,9 +5868,6 @@ _modify_node() {
                     read -r -s -p "请输入新 ShadowTLS 密码 (回车随机生成): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
                     read -r -s -p "请输入新内部 SS 密钥 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --base64 32)}
                     ;;
-                snell-v6)
-                    value=$("$SINGBOX_BIN" generate rand --hex 16) && [[ "$value" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
-                    ;;
                 socks)
                     read -r -p "请输入新用户名 (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate rand --hex 8)}
                     read -r -s -p "请输入新密码 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --hex 16)}
@@ -7343,7 +5879,7 @@ _modify_node() {
             ;;
         5)
             case "$variant" in
-                vless-reality|any-reality)
+                vless-reality|vless-xhttp-reality-enc|any-reality)
                     current=$(printf '%s' "$expected_node" | jq -r '.tls.reality.handshake.server // .tls.server_name // empty')
                     read -r -p "请输入新伪装域名/SNI (当前: ${current}): " value
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
@@ -7355,7 +5891,14 @@ _modify_node() {
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "伪装域名格式无效。"; return 1; }
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
                     ;;
-                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic)
+                vless-xhttp-enc)
+                    current=$(jq -r --arg tag "$tag" '.[$tag].host // empty' "$METADATA_FILE")
+                    [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.servername // .["xhttp-opts"].headers.Host // ""')
+                    read -r -p "请输入新回源域名 (当前: ${current}): " value
+                    [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名格式无效。"; return 1; }
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value"
+                    ;;
+                vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic|vless-xhttp-enc-tls)
                     current=$(printf '%s' "$expected_node" | jq -r '.tls.server_name // empty')
                     [ -n "$current" ] || current=$(_get_proxy_field "$proxy_name" '.sni // .servername // ""')
                     read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
@@ -7369,8 +5912,11 @@ _modify_node() {
                         read -r -p "请输入证书完整路径: " cert_path
                         read -r -p "请输入私钥完整路径: " key_path
                         _validate_tls_key_pair "$cert_path" "$key_path" || return 1
-                        read -r -p "客户端是否跳过证书链验证？[y/N]: " confirm
-                        skip_verify=false; [[ "$confirm" =~ ^[Yy]$ ]] && skip_verify=true
+                        skip_verify=false
+                        if [ "$variant" != "vless-xhttp-enc-tls" ]; then
+                            read -r -p "客户端是否跳过证书链验证？[y/N]: " confirm
+                            [[ "$confirm" =~ ^[Yy]$ ]] && skip_verify=true
+                        fi
                         _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" custom "$cert_path" "$key_path" "$skip_verify"
                     else
                         _error "无效选择。"; return 1
@@ -7386,9 +5932,14 @@ _modify_node() {
                     [[ "$confirm" =~ ^[Yy]$ ]] || return
                     _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" reality_keys
                     ;;
-                vless-ws-tls|trojan-ws-tls)
+                vless-enc-tcp)
+                    read -r -p "重新生成后旧客户端将立即失效，确认继续？[y/N]: " confirm
+                    [[ "$confirm" =~ ^[Yy]$ ]] || return
+                    _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" enc_keys
+                    ;;
+                vless-ws-tls|trojan-ws-tls|vless-xhttp-enc-tls|vless-xhttp-enc|vless-xhttp-reality-enc)
                     current=$(printf '%s' "$expected_node" | jq -r '.transport.path // "/"')
-                    read -r -p "请输入新 WebSocket 路径 (当前: ${current}): " value
+                    read -r -p "请输入新传输路径 (当前: ${current}): " value
                     [ -n "$value" ] || { _error "路径不能为空。"; return 1; }; [[ "$value" == /* ]] || value="/$value"
                     _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" transport "$value"
                     ;;
@@ -7408,6 +5959,12 @@ _modify_node() {
             esac
             ;;
         7)
+            if [ "$variant" = "vless-xhttp-reality-enc" ]; then
+                read -r -p "重新生成后旧客户端将立即失效，确认继续？[y/N]: " confirm
+                [[ "$confirm" =~ ^[Yy]$ ]] || return
+                _modify_node_apply "$tag" "$expected_node" "$expected_metadata" "$proxy_name" reality_keys
+                return $?
+            fi
             [ "$variant" = "hysteria2" ] || { _error "该节点没有端口跳跃。"; return 1; }
             current=$(jq -r --arg tag "$tag" '.[$tag].portHopping // "未启用"' "$METADATA_FILE")
             read -r -p "请输入新跳跃范围 start-end，输入 none 关闭 (当前: ${current}): " value
@@ -7436,7 +5993,7 @@ _download_bash_script_atomic() {
     mkdir -p "$(dirname "$target")" || return 1
     local tmp
     tmp=$(mktemp "$(dirname "$target")/.${label}.new.XXXXXX") || return 1
-    if ! wget -qO "$tmp" "$url" || [ ! -s "$tmp" ]; then
+    if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 -o "$tmp" "$url" || [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         _error "${label} 下载失败或内容为空。"
         return 1
@@ -7459,21 +6016,13 @@ _update_script_locked() {
         return 1
     fi
 
-    local cache_bust downloaded_version fixed_version script_name script_path script_url stage backup i j
-    local names=("singbox.sh" "advanced_relay.sh" "parser.sh" "xray_manager.sh")
+    local cache_bust downloaded_version script_name script_path script_url stage backup i j
+    local names=("singbox.sh")
     local targets=("$SELF_SCRIPT_PATH")
     local urls=()
-    local stages=() backups=() had_original=() changed=() changed_names=()
+    local stages=() backups=() had_original=()
     cache_bust=$(date +%s)
     urls+=("${SCRIPT_UPDATE_URL}?v=${cache_bust}")
-
-    for script_name in "${names[@]:1}"; do
-        script_path="${SINGBOX_DIR}/${script_name}"
-        # 与实际执行路径一致：开发/当前目录存在时优先更新它，否则更新生产副本。
-        [ -f "${SCRIPT_DIR}/${script_name}" ] && script_path="${SCRIPT_DIR}/${script_name}"
-        targets+=("$script_path")
-        urls+=("${GITHUB_RAW_BASE}/${script_name}?v=${cache_bust}")
-    done
 
     _info "正在预下载并校验全部脚本组件..."
     for i in "${!names[@]}"; do
@@ -7504,16 +6053,8 @@ _update_script_locked() {
         return 1
     fi
 
+    # 全部验证成功后才建回滚副本, 任一替换失败即恢复整组文件。
     for i in "${!targets[@]}"; do
-        if [ -x "${targets[$i]}" ] && cmp -s -- "${stages[$i]}" "${targets[$i]}"; then
-            continue
-        fi
-        changed+=("$i")
-        changed_names+=("${names[$i]}")
-    done
-
-    # 所有组件都验证成功后再备份待替换文件。任何一个替换失败都会恢复本次改动。
-    for i in "${changed[@]}"; do
         script_path=${targets[$i]}
         if [ -e "$script_path" ] || [ -L "$script_path" ]; then
             backup=$(mktemp "$(dirname "$script_path")/.${names[$i]}.rollback.XXXXXX") || {
@@ -7524,15 +6065,16 @@ _update_script_locked() {
                 rm -f -- "$backup" "${stages[@]}" "${backups[@]}"
                 return 1
             fi
-            backups[$i]="$backup"
-            had_original[$i]=1
+            backups+=("$backup")
+            had_original+=(1)
         else
-            had_original[$i]=0
+            backups+=("")
+            had_original+=(0)
         fi
     done
 
     local commit_failed=0
-    for i in "${changed[@]}"; do
+    for i in "${!targets[@]}"; do
         if ! chmod 755 "${stages[$i]}" || ! mv -f -- "${stages[$i]}" "${targets[$i]}"; then
             commit_failed=1
             break
@@ -7540,7 +6082,7 @@ _update_script_locked() {
     done
     if [ "$commit_failed" -ne 0 ]; then
         _error "脚本组提交失败，正在恢复更新前的全部组件。"
-        for j in "${changed[@]}"; do
+        for j in "${!targets[@]}"; do
             if [ "${had_original[$j]}" -eq 1 ] && [ -n "${backups[$j]}" ]; then
                 mv -f -- "${backups[$j]}" "${targets[$j]}" 2>/dev/null || true
             else
@@ -7552,19 +6094,11 @@ _update_script_locked() {
     fi
 
     rm -f -- "${stages[@]}" "${backups[@]}"
-    if [ "${#changed[@]}" -eq 0 ]; then
-        _info "四个脚本组件内容均无变化（v${downloaded_version}）。"
-    else
-        _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
-        _info "已替换组件：${changed_names[*]}"
-    fi
-    fixed_version=$(sed -nE 's/^(export[[:space:]]+)?SINGBOX_FIXED_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/v\2/p' "$SELF_SCRIPT_PATH" | tail -n 1)
-    _info "主脚本：${SELF_SCRIPT_PATH}"
-    _info "固定核心目标：${fixed_version:-未识别到明确版本}"
+    _success "脚本组件已作为一个事务完成更新：v${SCRIPT_VERSION} -> v${downloaded_version}"
 
     # yq 是独立工具，不参与脚本文件事务；失败时明确提示，不伪报全部成功。
     if ! _install_yq; then
-        _warning "yq 检查/更新失败，请检查网络后重试。"
+        _warning "脚本已更新，但 yq 检查/更新失败，请检查网络后重试。"
     fi
 
     _info "请重新运行脚本以应用所有变更："
@@ -7588,13 +6122,13 @@ _require_singbox() {
     return 0
 }
 
-# [安装/更新 Sing-box 核心] — 最新稳定版或固定版
 _install_or_update_singbox() {
-    local current_ver="未安装" choice confirm
+    local current_ver="未安装" choice confirm locked_ver=""
     if [ -f "${SINGBOX_BIN}" ]; then
-        current_ver=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}')
+        current_ver=$(env GOMEMLIMIT="$(_get_mem_limit)MiB" "${SINGBOX_BIN}" version 2>/dev/null | head -n1 | awk '{print $3}')
         [ -n "$current_ver" ] || current_ver="未知"
     fi
+    locked_ver=$(_read_singbox_core_lock 2>/dev/null || true)
 
     clear
     echo -e "${CYAN}"
@@ -7602,72 +6136,155 @@ _install_or_update_singbox() {
     echo '  ║       安装/更新 Sing-box 核心         ║'
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
+    echo -e "  来源: ${CYAN}github.com/${SINGBOX_LEAN_REPO} (tag ${SINGBOX_LEAN_RELEASE_TAG})${NC}"
     if [ "$current_ver" = "未安装" ]; then
         echo -e "  当前版本: ${YELLOW}未安装${NC}"
     else
         echo -e "  当前版本: ${GREEN}v${current_ver}${NC}"
     fi
-
-    if _singbox_core_is_locked; then
-        echo -e "  版本策略: ${YELLOW}固定版（目标 v${SINGBOX_FIXED_VERSION}）${NC}"
-        if [ "$current_ver" != "$SINGBOX_FIXED_VERSION" ]; then
-            _warn "当前核心与固定版目标不同，请选择 [2] 安装 v${SINGBOX_FIXED_VERSION}。"
+    if [ -n "$locked_ver" ]; then
+        echo -e "  版本策略: ${YELLOW}已锁定 v${locked_ver} (禁止更换版本, 可重装同版本)${NC}"
+        if [ "$current_ver" != "$locked_ver" ] && [ "$current_ver" != "未安装" ]; then
+            _warn "检测到锁定版本与当前核心不一致, 请先 [4] 解锁, 或重装 v${locked_ver} 恢复。"
         fi
     else
-        echo -e "  版本策略: ${GREEN}跟随最新稳定版${NC}"
+        echo -e "  版本策略: ${GREEN}未锁定, 可自由更新${NC}"
     fi
     echo ""
-    echo -e "    ${GREEN}[1]${NC} 安装/更新最新稳定版"
-    echo -e "    ${GREEN}[2]${NC} 安装固定版 v${SINGBOX_FIXED_VERSION}（安装后禁止升级）"
+    echo -e "    ${GREEN}[1]${NC} 安装/更新最新版 (tag ${SINGBOX_LEAN_RELEASE_TAG} 的最新资产)"
+    echo -e "    ${GREEN}[2]${NC} 安装历史版本 (列出仓库里所有已发布版本, 自选)"
+    echo -e "    ${GREEN}[3]${NC} 锁定当前版本 v${current_ver} (锁定后禁止更换版本)"
+    echo -e "    ${YELLOW}[4]${NC} 解除锁定 (之后可自由更新)"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    read -r -p "  请选择 [0-2]: " choice
+    read -r -p "  请选择 [0-4]: " choice
     case "$choice" in
         1)
-            if _singbox_core_is_locked; then
-                _error "固定版锁已启用，无法切换到跟随最新稳定版。"
-                _info "请选择 [2] 安装或重装固定版 v${SINGBOX_FIXED_VERSION}。"
+            if [ -n "$locked_ver" ]; then
+                _error "当前核心已锁定为 v${locked_ver}, 不允许更新到其他版本。"
+                _info "如需更新, 请先选 [4] 解除锁定; 如需修复, 可用 [2] 选 v${locked_ver} 重装。"
                 return 1
             fi
             _do_update_singbox latest
             ;;
         2)
-            if ! _singbox_core_is_locked; then
-                _warn "安装完成后，脚本将永久锁定 v${SINGBOX_FIXED_VERSION}，后续菜单不再允许核心升级。"
-                read -r -p "  确认安装并锁定固定版？(y/N): " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消固定版安装。"; return 0; }
+            if [ -n "$locked_ver" ]; then
+                _error "当前核心已锁定为 v${locked_ver}, 不允许更换版本。"
+                _info "如需更换, 请先选 [4] 解除锁定; 如需修复, 可在下面选 v${locked_ver} 重装。"
+                # 锁定时仍允许进列表选同版本重装, _do_update_singbox 会再校验。
             fi
-            _do_update_singbox "$SINGBOX_FIXED_VERSION"
+            _install_lean_historical
+            ;;
+        3)
+            if [ "$current_ver" = "未安装" ] || [ "$current_ver" = "未知" ]; then
+                _error "当前未安装可锁定的核心, 请先选 [1] 安装。"
+                return 1
+            fi
+            if [ "$locked_ver" = "$current_ver" ]; then
+                _info "已锁定 v${current_ver}, 无需重复锁定。"
+                return 0
+            fi
+            if [ -n "$locked_ver" ]; then
+                _warn "当前已锁定 v${locked_ver}, 将改为锁定 v${current_ver}。"
+            fi
+            read -r -p "  确认锁定当前版本 v${current_ver}? 锁定后 [1][2] 将拒绝更换版本 (y/N): " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消锁定。"; return 0; }
+            if _write_singbox_core_lock "$current_ver"; then
+                _secure_state_permissions
+                _success "已锁定当前版本 v${current_ver}。"
+            else
+                _error "锁定写入失败。"
+                return 1
+            fi
+            ;;
+        4)
+            if [ -z "$locked_ver" ]; then
+                _info "当前未锁定, 无需解除。"
+                return 0
+            fi
+            read -r -p "  确认解除 v${locked_ver} 的锁定? (y/N): " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消。"; return 0; }
+            _unlock_singbox_core
+            _success "已解除锁定, 现在可以自由更新核心。"
             ;;
         0) return 0 ;;
-        *) _error "无效输入，请选择 [0-2]。"; return 1 ;;
+        *) _error "无效输入, 请选择 [0-4]。"; return 1 ;;
     esac
 }
 
-# 执行 sing-box 核心的安装/更新
-_do_update_singbox() {
-    local install_target="${1:-latest}"
-    if [ "$install_target" = "latest" ] && _singbox_core_is_locked; then
-        _error "固定版锁已启用，拒绝执行 sing-box 核心升级。"
+_install_lean_historical() {
+    local versions_tsv
+    versions_tsv=$(_lean_list_versions) || versions_tsv=""
+    if [ -z "$versions_tsv" ]; then
+        _error "无法读取 ${SINGBOX_LEAN_REPO} 的发布信息。"
         return 1
     fi
+    echo ""
+    echo "  历史版本 (按发布时间倒序, 资产名 sing-box-<版本>-lean-<架构>):"
+    local i=1 ver tag published
+    local -a vers=()
+    while IFS=$'\t' read -r ver _name _url _digest tag published; do
+        [ -n "$ver" ] || continue
+        # 同版本只显示一次 (滚动 tag 里可能多资产同名)。
+        local dup=0 v
+        for v in "${vers[@]}"; do [ "$v" = "$ver" ] && dup=1 && break; done
+        [ "$dup" = "1" ] && continue
+        vers+=("$ver")
+        echo -e "    ${GREEN}[$i]${NC} v${ver}  (tag ${tag}, ${published:0:10})"
+        i=$((i + 1))
+    done < <(printf '%s\n' "$versions_tsv")
+    if [ "${#vers[@]}" -eq 0 ]; then
+        _error "仓库里没有可用的精简版资产。"
+        return 1
+    fi
+    echo "    [0] 返回"
+    echo ""
+    read -r -p "  请选择编号, 或直接输入版本号 (如 1.14.3-extended-2.7.3 / 1.15.0-alpha.13-xiaobaf14g.11): " choice
+    local target=""
+    if [ "$choice" = "0" ]; then return 0; fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#vers[@]}" ]; then
+        target="${vers[$((choice - 1))]}"
+    elif [[ "$choice" =~ $SINGBOX_VERSION_RE ]]; then
+        target="$choice"
+    else
+        _error "无效输入。"
+        return 1
+    fi
+    _do_update_singbox "$target"
+}
+
+# 锁定时只放行同版本重装; 未锁定时装完不自动锁定, 要单独选 [3]。
+_do_update_singbox() {
+    local install_target="${1:-latest}" locked_ver=""
+    locked_ver=$(_read_singbox_core_lock 2>/dev/null || true)
+    if [ -n "$locked_ver" ]; then
+        if [ "$install_target" = "latest" ]; then
+            _error "版本锁已启用 (v${locked_ver}), 拒绝更新到最新版。"
+            return 1
+        fi
+        if [ "$install_target" != "$locked_ver" ]; then
+            _error "版本锁已启用 (v${locked_ver}), 拒绝安装 v${install_target}。"
+            return 1
+        fi
+        _info "与锁定版本一致 (v${locked_ver}), 允许重装修复。"
+    fi
     case "$install_target" in
-        latest|"$SINGBOX_FIXED_VERSION") ;;
+        latest) ;;
+        [0-9]*-extended-*) ;;
+        [0-9]*-alpha.*-xiaobaf14g.*) ;;
         *) _error "无效的 sing-box 安装目标: ${install_target}"; return 1 ;;
     esac
 
-    _info "--- 安装/更新 Sing-box 核心 ---"
-    # 更新核心时复用已验证的依赖缓存，避免在 128M 容器中再次触发 apk
-    # 的高峰内存占用；缓存缺项时 _install_dependencies 仍会自愈安装。
+    _info "--- 安装/更新 Sing-box 核心 (精简版) ---"
     _install_dependencies
     if ! _install_sing_box "$install_target"; then
         _error "Sing-box 核心安装/更新失败。"
         return 1
     fi
 
-    _success "sing-box 核心已暂存，正在执行配置和服务验证。"
+    _success "sing-box 核心已暂存, 正在执行配置和服务验证。"
     if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
-        _info "检测到主配置文件缺失，正在初始化..."
+        _info "检测到主配置文件缺失, 正在初始化..."
         _initialize_config_files || { _rollback_singbox_binary; return 1; }
     fi
     _init_relay_config
@@ -7676,7 +6293,7 @@ _do_update_singbox() {
 
     local check_result
     if ! check_result=$(_check_combined_config_files "$SINGBOX_BIN" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>&1); then
-        _error "新核心未通过 config.json + relay.json 组合校验，正在恢复旧核心："
+        _error "新核心未通过 config.json + relay.json 组合校验, 正在恢复旧核心:"
         echo "$check_result"
         _rollback_singbox_binary
         return 1
@@ -7686,314 +6303,413 @@ _do_update_singbox() {
     _setup_log_cleanup
     _info "正在启动/重启 [主] 服务 (sing-box)..."
     if ! _manage_service restart; then
-        _error "新核心启动失败，正在恢复旧核心。"
+        _error "新核心启动失败, 正在恢复旧核心。"
         _rollback_singbox_binary
         if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
         return 1
     fi
 
-    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
-        if ! _write_singbox_core_lock; then
-            _error "固定版本锁写入失败，正在恢复旧核心。"
-            _manage_service stop >/dev/null 2>&1 || true
-            _rollback_singbox_binary
-            if [ -x "$SINGBOX_BIN" ]; then _manage_service restart >/dev/null 2>&1 || true; fi
-            return 1
-        fi
-        _secure_state_permissions
-    fi
     _commit_singbox_binary
-    if [ "$install_target" = "$SINGBOX_FIXED_VERSION" ]; then
-        _success "[主] 服务已使用固定核心 v${SINGBOX_FIXED_VERSION} 启动，版本升级锁已生效。"
+    if [ -n "$locked_ver" ]; then
+        _success "[主] 服务已使用锁定核心 v${SINGBOX_STAGED_VERSION:-未知} 启动, 锁定 v${locked_ver} 保持生效。"
     else
-        _success "[主] 服务已使用最新稳定核心 v${SINGBOX_STAGED_VERSION:-未知} 启动，更新已提交。"
+        _success "[主] 服务已使用精简核心 v${SINGBOX_STAGED_VERSION:-未知} 启动, 更新已提交 (未锁定, 可在菜单 [3] 锁定当前版本)。"
     fi
 }
 
-# [安装/更新 Xray 核心] — 双模态：未装就装、已装就更新
-_install_or_update_xray() {
-    local xray_bin="/usr/local/bin/xray"
-    if [ -f "$xray_bin" ]; then
-        local current_ver=$($xray_bin version 2>/dev/null | head -1 | awk '{print $2}')
-        _info "当前 Xray 版本: v${current_ver}，正在检查更新..."
-    else
-        _info "Xray 核心未安装，正在执行首次安装..."
+# --- WARP ---
+# Google 送中时默认规则与自定义域名走 WARP，其余直连；凭据来自 wgcf 注册。
+# reserved 不在 wgcf 输出里，须用 API client_id 再算：base64 解码得到的 3 个字节。
+
+_warp_state_init() {
+    mkdir -p "$SINGBOX_DIR" || return 1
+    if [ ! -s "$WARP_STATE_FILE" ]; then
+        printf '%s\n' '{"enabled":false,"custom_domains":[]}' > "$WARP_STATE_FILE" || return 1
     fi
-    _with_state_lock _do_update_xray
+    chmod 600 "$WARP_STATE_FILE" 2>/dev/null || true
+    jq empty "$WARP_STATE_FILE" >/dev/null 2>&1
 }
 
-_start_direct_xray() {
-    local binary="$1" config="$2" pid
-    mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" || return 1
-    rm -f -- "$XRAY_PID_FILE" || return 1
-    nohup "$binary" run -c "$config" >> /var/log/xray.log 2>&1 8>&- 9>&- 219>&- &
-    pid=$!
-    printf '%s\n' "$pid" > "$XRAY_PID_FILE" || { kill "$pid" 2>/dev/null; return 1; }
-    sleep 1
-    _is_pid_file_running_cmd "$XRAY_PID_FILE" "$binary" || { rm -f -- "$XRAY_PID_FILE"; return 1; }
+_warp_enabled() {
+    [ -s "$WARP_STATE_FILE" ] && jq -e '.enabled == true' "$WARP_STATE_FILE" >/dev/null 2>&1
 }
 
-# 执行 Xray 核心的安装/更新 (内联实现，避免依赖 xray_manager.sh 的 source)
-_do_update_xray() {
-    _info "--- 安装/更新 Xray 核心 ---"
-    local xray_bin="/usr/local/bin/xray"
-    local xray_dir="/usr/local/etc/xray"
-    local is_first_install=false
-    [ ! -f "$xray_bin" ] && is_first_install=true
-    command -v unzip &>/dev/null || _pkg_install unzip
+_warp_has_credentials() {
+    [ -s "$WARP_STATE_FILE" ] && jq -e '(.private_key // "" | length > 0) and (.address // [] | length > 0) and (.reserved // [] | length == 3)' "$WARP_STATE_FILE" >/dev/null 2>&1
+}
 
-    local arch=$(uname -m)
-    local xray_arch=""
+_warp_install_wgcf() {
+    [ -x "$WGCF_BIN" ] && return 0
+    local arch
+    arch=$(uname -m)
     case "$arch" in
-        x86_64|amd64)  xray_arch="64" ;;
-        aarch64|arm64) xray_arch="arm64-v8a" ;;
-        armv7l)        xray_arch="arm32-v7a" ;;
-        *)             _error "Xray 不支持当前架构: $arch"; return 1 ;;
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) _error "wgcf 不支持架构: $arch (仅 amd64 / arm64)"; return 1 ;;
     esac
-
-    local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
-    local digest_url="${download_url}.dgst"
-    local tmp_dir
-    mkdir -p /var/tmp || return 1
-    tmp_dir=$(mktemp -d /var/tmp/.xray-install.XXXXXX) || return 1
-    local tmp_zip="${tmp_dir}/xray.zip"
-
-    _info "下载地址: ${download_url}"
-    if ! wget -qO "$tmp_zip" "$download_url" || ! wget -qO "${tmp_zip}.dgst" "$digest_url"; then
-        _error "Xray 安装包或官方摘要下载失败！"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    local expected actual
-    expected=$(awk -F'= *' 'toupper($1) == "SHA2-256" || toupper($1) == "SHA256" {print $2; exit}' "${tmp_zip}.dgst" | tr -d ' \r\n')
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$tmp_zip" | awk '{print $1}')
-    else
-        actual=$(openssl dgst -sha256 "$tmp_zip" 2>/dev/null | awk '{print $NF}')
-    fi
-    if [ -z "$expected" ] || [ -z "$actual" ] || [ "${expected,,}" != "${actual,,}" ]; then
-        _error "Xray 安装包 SHA-256 校验失败，已拒绝替换核心。"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    # 只提取运行所需的三个文件，避免完整展开后再复制核心产生双份页缓存。
-    # 这对 128MB 一类低内存容器尤为重要。
-    if ! unzip -tq "$tmp_zip" >/dev/null 2>&1 || ! unzip -p "$tmp_zip" xray > "${tmp_dir}/xray"; then
-        _error "Xray 解压失败！"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    local geodata_file
-    for geodata_file in geoip.dat geosite.dat; do
-        if unzip -p "$tmp_zip" "$geodata_file" > "${tmp_dir}/${geodata_file}" 2>/dev/null; then
-            chmod 600 "${tmp_dir}/${geodata_file}" 2>/dev/null || true
-        else
-            rm -f -- "${tmp_dir}/${geodata_file}"
-        fi
+    local url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${arch}"
+    local tmp try ok=0
+    tmp=$(mktemp /tmp/.wgcf.XXXXXX) || return 1
+    for try in 1 2 3; do
+        if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$url" && [ -s "$tmp" ]; then ok=1; break; fi
+        sleep 2
     done
-    local new_xray="${tmp_dir}/xray"
-    [ -f "$new_xray" ] || { _error "压缩包中没有 Xray 可执行文件。"; rm -rf "$tmp_dir"; return 1; }
-    chmod 755 "$new_xray" || { rm -rf "$tmp_dir"; return 1; }
-    "$new_xray" version >/dev/null 2>&1 || { _error "下载的 Xray 无法执行。"; rm -rf "$tmp_dir"; return 1; }
+    if [ "$ok" != "1" ]; then rm -f "$tmp"; _error "wgcf 下载失败 (3 次重试后)。"; return 1; fi
+    chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$WGCF_BIN" || { rm -f "$tmp"; return 1; }
+}
 
-    mkdir -p "$xray_dir" || { rm -rf "$tmp_dir"; return 1; }
-    chmod 700 "$xray_dir" 2>/dev/null || true
-    if [ ! -s "${xray_dir}/config.json" ]; then
-        printf '%s\n' '{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}],"routing":{"rules":[]}}' > "${xray_dir}/config.json"
-    fi
-    [ -s "${xray_dir}/metadata.json" ] || printf '%s\n' '{}' > "${xray_dir}/metadata.json"
-    chmod 600 "${xray_dir}/config.json" "${xray_dir}/metadata.json" 2>/dev/null || true
-    if ! "$new_xray" run -test -config "${xray_dir}/config.json" >/dev/null 2>&1; then
-        _error "新 Xray 核心无法加载现有配置，已取消更新。"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
+# 核心是否含 WireGuard；不含时拒绝启用，避免配了个永远握不上手的 endpoint。
+_warp_core_supports_wireguard() {
+    [ -x "$SINGBOX_BIN" ] || return 1
+    # 不用 mktemp：部分系统（busybox/toybox）的 mktemp 要求模板以 XXXXXX 结尾，
+    # 带 .json 后缀的模板会直接报错，探针还没跑就判不支持。
+    local tmp="/tmp/.warp-core-check.$$.json" rc
+    printf '%s\n' '{"log":{"level":"error"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"wireguard","tag":"warp","address":["172.16.0.2/32"],"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peers":[{"address":"engage.cloudflareclient.com","port":2408,"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=","allowed_ips":["0.0.0.0/0"]}],"mtu":1280}]}' > "$tmp" || return 1
+    env GOMEMLIMIT="$(_get_mem_limit)MiB" "$SINGBOX_BIN" check -c "$tmp" >/dev/null 2>&1
+    rc=$?
+    rm -f "$tmp"
+    return $rc
+}
 
-    local staged_xray backup_xray="" had_old="false"
-    staged_xray=$(mktemp "$(dirname "$xray_bin")/.xray.new.XXXXXX") || { rm -rf "$tmp_dir"; return 1; }
-    rm -f -- "$staged_xray"
-    mv -f -- "$new_xray" "$staged_xray" && chmod 755 "$staged_xray" || { rm -f "$staged_xray"; rm -rf "$tmp_dir"; return 1; }
-    if [ -f "$xray_bin" ]; then
-        had_old="true"
-        backup_xray="$(dirname "$xray_bin")/.xray.rollback.$$"
-        cp -p "$xray_bin" "$backup_xray" || { rm -f "$staged_xray"; rm -rf "$tmp_dir"; return 1; }
-    fi
-    mv -f "$staged_xray" "$xray_bin" || { rm -f "$staged_xray" "$backup_xray"; rm -rf "$tmp_dir"; return 1; }
-    [ -f "${tmp_dir}/geoip.dat" ] && mv -f "${tmp_dir}/geoip.dat" "$xray_dir/"
-    [ -f "${tmp_dir}/geosite.dat" ] && mv -f "${tmp_dir}/geosite.dat" "$xray_dir/"
-
-    _create_xray_service_from_main
-    local service_ok="true" direct_stopped=false
-    if [ "$INIT_SYSTEM" == "systemd" ]; then
-        if [ "$is_first_install" = true ] || systemctl is-active xray >/dev/null 2>&1; then systemctl reset-failed xray >/dev/null 2>&1 || true; systemctl restart xray 8>&- 9>&- 219>&- || service_ok="false"; fi
-    elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        if [ "$is_first_install" = true ] || rc-service xray status >/dev/null 2>&1; then rc-service xray restart 8>&- 9>&- 219>&- || service_ok="false"; fi
-    elif [ "$INIT_SYSTEM" == "direct" ]; then
-        if _direct_xray_pid stop "$XRAY_PID_FILE" "$xray_bin" "${xray_dir}/config.json"; then
-            direct_stopped=true
-            _start_direct_xray "$xray_bin" "${xray_dir}/config.json" || service_ok=false
-        else
-            service_ok=false
+_warp_register() {
+    _warp_install_wgcf || return 1
+    mkdir -p "$SINGBOX_DIR" || return 1
+    if [ ! -s "$WARP_ACCOUNT_FILE" ] || ! grep -q "device_id" "$WARP_ACCOUNT_FILE" 2>/dev/null; then
+        _info "正在向 Cloudflare 注册 WARP 账号..."
+        if ! (cd "$SINGBOX_DIR" && "$WGCF_BIN" register --accept-tos >/dev/null 2>&1); then
+            _error "WARP 注册失败，请检查网络后重试。"
+            return 1
         fi
     fi
+    if ! (cd "$SINGBOX_DIR" && "$WGCF_BIN" generate >/dev/null 2>&1); then
+        _error "WARP 配置生成失败。"
+        return 1
+    fi
+    local device_id access_token private_key v4 v6 client_id reserved_json api_resp
+    device_id=$(grep -E "^device_id" "$WARP_ACCOUNT_FILE" | sed -E "s/^[^=]*=[[:space:]]*//; s/^'//; s/'$//")
+    access_token=$(grep -E "^access_token" "$WARP_ACCOUNT_FILE" | sed -E "s/^[^=]*=[[:space:]]*//; s/^'//; s/'$//")
+    private_key=$(grep -E "^PrivateKey" "$WARP_PROFILE_FILE" | sed -E "s/^[^=]*=[[:space:]]*//; s/^'//; s/'$//")
+    v4=$(grep -E "^Address" "$WARP_PROFILE_FILE" | cut -d= -f2- | tr -d ' ' | cut -d, -f1)
+    v6=$(grep -E "^Address" "$WARP_PROFILE_FILE" | cut -d= -f2- | tr -d ' ' | cut -d, -f2)
+    [ -n "$device_id" ] && [ -n "$access_token" ] && [ -n "$private_key" ] && [ -n "$v4" ] && [ -n "$v6" ] || {
+        _error "WARP 凭据解析失败。"
+        return 1
+    }
+    api_resp=$(curl -s --max-time 20 -H "Authorization: Bearer $access_token" -H "User-Agent: 1.1.1.1/6.38.9-5641 (Android 16.0.0)" -H "CF-Client-Version: a-6.38.9-5641" "https://api.cloudflareclient.com/v0a5641/reg/$device_id" 2>/dev/null)
+    client_id=$(printf '%s' "$api_resp" | jq -r '.config.client_id // empty' 2>/dev/null)
+    [ -n "$client_id" ] || { _error "拿不到 client_id，reserved 无法计算，WARP 不启用。"; return 1; }
+    reserved_json=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 | tr -s ' ' | sed -e 's/^ //' -e 's/ /,/g' -e 's/^/[/' -e 's/$/]/')
+    printf '%s' "$reserved_json" | jq -e 'length == 3' >/dev/null 2>&1 || { _error "reserved 计算失败，WARP 不启用。"; return 1; }
+    _warp_state_init || return 1
+    _atomic_modify_json "$WARP_STATE_FILE" '.private_key = $pk | .address = [$v4, $v6] | .reserved = $rs' \
+        --arg pk "$private_key" --arg v4 "$v4" --arg v6 "$v6" --argjson rs "$reserved_json" || return 1
+    _secure_state_permissions
+}
 
-    if [ "$service_ok" != "true" ]; then
-        _error "Xray 新核心启动失败，正在恢复旧核心。"
-        if [ "$had_old" = "true" ] && [ -s "$backup_xray" ]; then mv -f "$backup_xray" "$xray_bin"; else rm -f "$xray_bin"; fi
-        if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart xray >/dev/null 2>&1 || true; fi
-        if [ "$had_old" = "true" ] && [ "$INIT_SYSTEM" = "openrc" ]; then rc-service xray restart >/dev/null 2>&1 || true; fi
-        if [ "$had_old" = true ] && [ "$direct_stopped" = true ]; then
-            if ! _start_direct_xray "$xray_bin" "${xray_dir}/config.json"; then
-                _error "旧 Xray 核心已恢复，但 direct 模式重新启动失败，请检查 /var/log/xray.log。"
+# 自定义域名 + 默认 google.com，拼成一个 inline 规则集。
+_warp_custom_ruleset_json() {
+    jq -c --arg tag "$WARP_CUSTOM_TAG" '
+        {type:"inline", tag:$tag, rules:[{domain:(["google.com"] + (.custom_domains // [])), domain_suffix:([".google.com"] + (.custom_domains // [] | map("." + .)))}]}
+    ' "$WARP_STATE_FILE"
+}
+
+# 只改配置不重启（调用方负责）；未启用时等价于移除 WARP 配置。
+# 端点必须写 IP：这版核只往写死的 endpoint IP 发包，写域名握手通、数据永远报 no known endpoint for peer；每次 apply 重解析，解析不到用 Cloudflare 固定 anycast IP。
+_warp_resolve_peer_ip() {
+    local ip=""
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahosts "$WARP_ENDPOINT_HOST" 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1; exit}')
+    fi
+    if [ -z "$ip" ] && command -v nslookup >/dev/null 2>&1; then
+        ip=$(nslookup "$WARP_ENDPOINT_HOST" 2>/dev/null | awk '/Address/ && $NF ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {ip=$NF} END {print ip}')
+    fi
+    if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip="$WARP_ENDPOINT_IP_FALLBACK"
+    fi
+    printf '%s' "$ip"
+}
+
+_warp_apply_config() {
+    _warp_state_init || return 1
+    if ! _warp_enabled; then _warp_remove_config; return 0; fi
+    _warp_has_credentials || { _error "WARP 凭据不完整，请先重新启用。"; return 1; }
+    local endpoint_json remote_json custom_json rule_sets_json warp_ip srs_tmp offline="${1:-}"
+    warp_ip=$(_warp_resolve_peer_ip)
+    _info "WARP 节点地址：${warp_ip}:2408（${WARP_ENDPOINT_HOST} 解析结果）"
+    endpoint_json=$(jq -c --arg pk "$WARP_PUBLIC_KEY" --arg host "$warp_ip" '
+        {type:"wireguard", tag:"warp", address:.address, private_key:.private_key,
+         peers:[{address:$host, port:2408, public_key:$pk, allowed_ips:["0.0.0.0/0","::/0"], reserved:.reserved}],
+         mtu:1280}
+    ' "$WARP_STATE_FILE") || return 1
+    # 远程规则集不用 remote + download_detour：1.15 里已废弃，run 时直接 FATAL（check 不触发）。
+    # 改由脚本 curl 拉 .srs 到本地、配置写 local 规则集；拉不到只留内联规则，启动不依赖网络。
+    if [ "$offline" != "--offline" ]; then
+        srs_tmp=$(mktemp "${WARP_RULE_SET_FILE}.tmp.XXXXXX") || return 1
+        if curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 "$WARP_RULE_SET_URL" -o "$srs_tmp" 2>/dev/null && [ -s "$srs_tmp" ]; then
+            chmod 600 "$srs_tmp" 2>/dev/null || true
+            mv -f -- "$srs_tmp" "$WARP_RULE_SET_FILE" || { rm -f -- "$srs_tmp"; return 1; }
+        else
+            rm -f -- "$srs_tmp"
+            [ -s "$WARP_RULE_SET_FILE" ] && _warn "Gemini 规则集更新失败，继续沿用本地缓存。"
+        fi
+    fi
+    if [ -s "$WARP_RULE_SET_FILE" ]; then
+        remote_json=$(jq -cn --arg tag "$WARP_RULE_SET_TAG" --arg path "$WARP_RULE_SET_FILE" '
+            {type:"local", tag:$tag, format:"binary", path:$path}
+        ') || return 1
+        rule_sets_json='["geosite-google-gemini","warp-custom"]'
+    else
+        _warn "Gemini 规则集下载失败，本次只用内联规则（google.com 仍走 WARP）。"
+        remote_json="null"
+        rule_sets_json='["warp-custom"]'
+    fi
+    custom_json=$(_warp_custom_ruleset_json) || return 1
+    # warp 域名先走 resolve 规则（prefer_ipv6 解析，v6 优先、v6 没有回落 v4，不锁死），
+    # 再走 warp 出站。端点 DialContext 只接受 IP，目标域名由路由层解析，
+    # 所以端点的 domain_resolver 对目标域名无效，必须用路由 resolve 规则。
+    _atomic_modify_json "$CONFIG_FILE" '
+        .endpoints = ((.endpoints // []) | map(select(.tag != "warp")) + [$ep])
+        | .route = (.route // {"rules":[]})
+        | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != "geosite-google-gemini" and .tag != "warp-custom")) + (if $rs == null then [] else [$rs] end) + [$cs])
+        | .route.rules = ([{rule_set:$rsl, action:"resolve", server:"dns-local", strategy:"prefer_ipv6"}, {rule_set:$rsl, outbound:"warp"}] + ((.route.rules // []) | map(select(.outbound != "warp" and (([.rule_set[]?] | index("warp-custom") | not))))))
+        | .experimental = ((.experimental // {}) + {cache_file:{enabled:true, path:$cache}})
+    ' --argjson ep "$endpoint_json" --argjson rs "$remote_json" --argjson cs "$custom_json" --argjson rsl "$rule_sets_json" --arg cache "${SINGBOX_DIR}/cache.db" || return 1
+    _check_combined_config_files || return 1
+}
+
+_warp_remove_config() {
+    [ -s "$CONFIG_FILE" ] || return 0
+    rm -f "$WARP_RULE_SET_FILE"
+    _atomic_modify_json "$CONFIG_FILE" '
+        .endpoints = ((.endpoints // []) | map(select(.tag != "warp")))
+        | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != "geosite-google-gemini" and .tag != "warp-custom")))
+        | .route.rules = ((.route.rules // []) | map(select(.outbound != "warp" and (([.rule_set[]?] | index("warp-custom") | not)))))
+    ' || return 1
+    _check_combined_config_files || return 1
+}
+
+_warp_enable() {
+    _warp_state_init || return 1
+    if ! _warp_core_supports_wireguard; then
+        _error "当前核心不含 WireGuard (with_wireguard)，无法启用 WARP。"
+        _info "请先安装带 with_wireguard,with_gvisor 的核心，再启用。"
+        return 1
+    fi
+    if ! _warp_has_credentials; then
+        _warp_register || return 1
+    fi
+    _atomic_modify_json "$WARP_STATE_FILE" '.enabled = true' || return 1
+    if ! _warp_apply_config; then
+        _atomic_modify_json "$WARP_STATE_FILE" '.enabled = false' 2>/dev/null || true
+        _warp_remove_config 2>/dev/null || true
+        return 1
+    fi
+    if ! _manage_service "restart"; then
+        _atomic_modify_json "$WARP_STATE_FILE" '.enabled = false' 2>/dev/null || true
+        _warp_remove_config 2>/dev/null || true
+        _manage_service "restart" >/dev/null 2>&1 || true
+        return 1
+    fi
+    _success "WARP 已启用：Google (Gemini 规则集 + google.com) 与自定义域名走 WARP，其余直连。"
+    _info "验证：用客户端访问 google.com 应不再跳到 google.com.hk；https://1.1.1.1/cdn-cgi/trace 应显示 warp=on。"
+}
+
+_warp_disable() {
+    _warp_state_init || return 1
+    _atomic_modify_json "$WARP_STATE_FILE" '.enabled = false' || return 1
+    _warp_remove_config || return 1
+    _manage_service "restart" || return 1
+    _success "WARP 已停用。"
+}
+
+# 换 IP：丢弃旧账号重新注册，自定义域名保留；未启用时只换账号不启用。
+_warp_rotate() {
+    local domains was_enabled=0 confirm backup_dir
+    domains=$(jq -c '.custom_domains // []' "$WARP_STATE_FILE" 2>/dev/null || echo '[]')
+    _warp_enabled && was_enabled=1
+    read -r -p "  换 IP 会丢弃当前 WARP 账号并重新注册（注册失败会恢复旧账号），自定义域名保留，确定吗？[y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消。"; return 0; }
+    backup_dir=$(mktemp -d /tmp/.warp-rotate.XXXXXX) || return 1
+    # 只挪走凭据文件，不动 config.json 与 .srs；注册失败时原地恢复，运行中的 WARP 零中断。
+    mv -f -- "$WARP_STATE_FILE" "$WARP_ACCOUNT_FILE" "$WARP_PROFILE_FILE" "$backup_dir/" 2>/dev/null || true
+    if ! _warp_register; then
+        _error "WARP 重新注册失败，正在恢复旧账号..."
+        mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
+        rm -rf -- "$backup_dir"
+        _error "WARP 重新注册失败，已恢复旧账号。"
+        return 1
+    fi
+    _atomic_modify_json "$WARP_STATE_FILE" '.custom_domains = $d' --argjson d "$domains" || {
+        mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+    if [ "$was_enabled" != "1" ]; then
+        rm -rf -- "$backup_dir"
+        _success "WARP 账号已更换（当前未启用，启用后生效）。"
+        return 0
+    fi
+    _atomic_modify_json "$WARP_STATE_FILE" '.enabled = true' || {
+        mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
+        rm -rf -- "$backup_dir"
+        return 1
+    }
+    if ! _warp_apply_config; then
+        mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
+        rm -rf -- "$backup_dir"
+        _warp_apply_config >/dev/null 2>&1 || true
+        _manage_service "restart" >/dev/null 2>&1 || true
+        _error "WARP 新账号配置失败，已恢复旧账号。"
+        return 1
+    fi
+    if ! _manage_service "restart"; then
+        mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
+        mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
+        rm -rf -- "$backup_dir"
+        _warp_apply_config >/dev/null 2>&1 || true
+        _manage_service "restart" >/dev/null 2>&1 || true
+        _error "WARP 重启失败，已恢复旧账号。"
+        return 1
+    fi
+    rm -rf -- "$backup_dir"
+    _success "WARP IP 已更换：新账号已注册并启用，自定义域名已保留。"
+    _info "验证：用客户端访问 google.com 应不再跳到 google.com.hk；https://1.1.1.1/cdn-cgi/trace 应显示 warp=on。"
+}
+
+_warp_normalize_domain() {
+    local d="$1"
+    d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\*\.//' -e 's/^\.//' -e 's/\.$//')
+    [[ "$d" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || return 1
+    printf '%s' "$d"
+}
+
+_warp_add_domain() {
+    local input domain
+    read -r -p "  输入域名 (如 cloudflare.com，*.cloudflare.com 也行): " input
+    domain=$(_warp_normalize_domain "$input") || { _error "域名格式无效: $input"; return 1; }
+    _warp_state_init || return 1
+    _atomic_modify_json "$WARP_STATE_FILE" '.custom_domains = ((.custom_domains // []) + [$d] | unique)' --arg d "$domain" || return 1
+    if _warp_enabled; then
+        if [ -s "$WARP_RULE_SET_FILE" ]; then
+            _warp_apply_config --offline && _manage_service "restart" || return 1
+        else
+            _warp_apply_config && _manage_service "restart" || return 1
+        fi
+    fi
+    _success "已加: $domain (本体与 *.${domain} 都走 WARP)"
+}
+
+_warp_remove_domain() {
+    _warp_state_init || return 1
+    local -a domains=()
+    local line input token idx total=0
+    while IFS= read -r line; do
+        [ -n "$line" ] && domains+=("$line")
+    done < <(jq -r '.custom_domains[]?' "$WARP_STATE_FILE" 2>/dev/null)
+    total=${#domains[@]}
+    if [ "$total" -eq 0 ]; then
+        _info "没有自定义域名。"
+        return 0
+    fi
+    echo ""
+    for ((idx = 0; idx < total; idx++)); do
+        echo -e "    ${GREEN}[$((idx + 1))]${NC} ${domains[$idx]}"
+    done
+    echo -e "    ${RED}[all]${NC} 清空全部自定义域名"
+    echo -e "    ${YELLOW}[0]${NC} 返回"
+    echo ""
+    read -r -p "  请输入要删除的编号 (支持多选如 1 3 或 1,2): " input
+    local -a tokens=()
+    read -r -a tokens <<< "${input//,/ }"
+    [ "${#tokens[@]}" -eq 0 ] && return 0
+    if [ "${#tokens[@]}" -eq 1 ] && [ "${tokens[0]}" = "0" ]; then return 0; fi
+    local -a to_remove=()
+    local seen=" "
+    if [ "${#tokens[@]}" -eq 1 ] && [[ "${tokens[0],,}" == "all" ]]; then
+        local confirm
+        read -r -p "  确定清空全部 ${total} 个自定义域名? (y/N): " confirm
+        [[ "$confirm" == "y" || "$confirm" == "Y" ]] || return 0
+        to_remove=("${domains[@]}")
+    else
+        for token in "${tokens[@]}"; do
+            [[ "$token" =~ ^[0-9]+$ ]] || { _error "无效编号: ${token} (范围 1-${total})"; return 1; }
+            local n=$((10#$token))
+            if [ "$n" -lt 1 ] || [ "$n" -gt "$total" ]; then
+                _error "无效编号: ${token} (范围 1-${total})"
+                return 1
             fi
-        fi
-        rm -rf "$tmp_dir"
-        return 1
+            if [[ "$seen" != *" $n "* ]]; then
+                seen+=" $n "
+                to_remove+=("${domains[$((n - 1))]}")
+            fi
+        done
     fi
-
-    rm -f "$backup_xray"
-    local version
-    version=$($xray_bin version 2>/dev/null | head -1 | awk '{print $2}')
-    rm -rf "$tmp_dir"
-    _release_install_cache
-    _success "Xray-core v${version} 已校验、替换并成功启动。"
-}
-
-# 从主脚本创建 Xray 服务文件 (内联实现)
-_create_xray_service_from_main() {
-    local xray_bin="/usr/local/bin/xray"
-    local xray_dir="/usr/local/etc/xray"
-    if [ "$INIT_SYSTEM" == "systemd" ]; then
-        if [ ! -f "/etc/systemd/system/xray.service" ]; then
-            cat > /etc/systemd/system/xray.service << EOF
-[Unit]
-Description=Xray Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${xray_bin} run -c ${xray_dir}/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload
-            systemctl enable xray
-        fi
-    elif [ "$INIT_SYSTEM" == "openrc" ]; then
-        local openrc_service="/etc/init.d/xray"
-        local rewrite_openrc="false"
-        if [ ! -f "$openrc_service" ]; then
-            rewrite_openrc="true"
-        elif grep -Fqx 'pidfile="/run/xray.pid"' "$openrc_service" 2>/dev/null; then
-            # 仅迁移本项目旧模板，避免覆盖用户自定义的其他 OpenRC 服务。
-            rewrite_openrc="true"
-        fi
-        if [ "$rewrite_openrc" = "true" ]; then
-            local openrc_tmp
-            openrc_tmp=$(mktemp /etc/init.d/.xray.XXXXXX) || return 1
-            cat > "$openrc_tmp" << 'EOF'
-#!/sbin/openrc-run
-name="xray"
-description="Xray Service"
-command="/usr/local/bin/xray"
-command_args="run -c /usr/local/etc/xray/config.json"
-command_background=true
-pidfile="/run/singboxlite/xray.pid"
-
-start_pre() {
-    checkpath -d -m 0700 /run/singboxlite
-}
-EOF
-            chmod 755 "$openrc_tmp" && mv -f "$openrc_tmp" "$openrc_service" || { rm -f "$openrc_tmp"; return 1; }
-            rc-update add xray default 2>/dev/null
-        fi
-        mkdir -p "$XRAY_RUNTIME_DIR" && chmod 700 "$XRAY_RUNTIME_DIR" 2>/dev/null || true
-    fi
-}
-
-# --- 进阶功能 (子脚本) ---
-_advanced_features() {
-    local script_name="advanced_relay.sh"
-    local script_path="${SINGBOX_DIR}/${script_name}"
-    
-    # 优先检测当前目录 (开发者/测试点优先)
-    if [ -f "$SCRIPT_DIR/$script_name" ]; then
-        script_path="$SCRIPT_DIR/$script_name"
-    fi
-
-    # 如果都不存在，则下载
-    if [ ! -f "$script_path" ]; then
-        _info "本地未检测到进阶脚本，正在尝试下载..."
-        local download_url="${GITHUB_RAW_BASE}/${script_name}"
-        
-        if _download_bash_script_atomic "$download_url" "$script_path" "$script_name"; then
-            _success "下载成功！"
+    [ "${#to_remove[@]}" -gt 0 ] || return 0
+    local remove_json
+    remove_json=$(printf '%s\n' "${to_remove[@]}" | jq -R . | jq -s .) || return 1
+    _atomic_modify_json "$WARP_STATE_FILE" '.custom_domains = ((.custom_domains // []) - $rm)' --argjson rm "$remove_json" || return 1
+    if _warp_enabled; then
+        if [ -s "$WARP_RULE_SET_FILE" ]; then
+            _warp_apply_config --offline && _manage_service "restart" || return 1
         else
-            _error "下载失败！请检查网络或确认 GitHub 仓库地址。"
-            # 清理可能的空文件
-            rm -f "$script_path"
-            return 1
+            _warp_apply_config && _manage_service "restart" || return 1
         fi
     fi
-
-    # 执行脚本
-    if [ -f "$script_path" ]; then
-        if ! bash -n "$script_path" 2>/dev/null; then
-            _error "进阶脚本未通过 Bash 语法检查，已拒绝执行: ${script_path}"
-            return 1
-        fi
-        # 赋予权限并执行
-        chmod 755 "$script_path"
-        bash "$script_path"
-    else
-        _error "找不到进阶脚本文件: ${script_path}"
-    fi
+    _success "已删除 ${#to_remove[@]} 个域名: ${to_remove[*]}"
 }
 
-# --- Xray 节点管理 (子脚本) ---
-_xray_features() {
-    # 前置检查：Xray 核心必须已安装
-    if [ ! -f "/usr/local/bin/xray" ]; then
-        _error "Xray 核心未安装！请先通过主菜单【核心管理】-> [16] 进行安装。"
-        return 1
-    fi
-    _install_yq || return 1
-
-    local script_name="xray_manager.sh"
-    local script_path="${SINGBOX_DIR}/${script_name}"
-    
-    if [ -f "$SCRIPT_DIR/$script_name" ]; then
-        script_path="$SCRIPT_DIR/$script_name"
-    fi
-    
-    if [ ! -f "$script_path" ]; then
-        _info "本地未检测到 Xray 管理脚本，正在尝试下载..."
-        local download_url="${GITHUB_RAW_BASE}/${script_name}"
-        if _download_bash_script_atomic "$download_url" "$script_path" "$script_name"; then
-            _success "下载成功！"
-        else
-            _error "下载失败！请检查网络或确认 GitHub 仓库地址。"
-            rm -f "$script_path"
-            return 1
+_warp_menu() {
+    local warp_core_ok=""
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║            WARP 设置                  ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        _warp_state_init 2>/dev/null || true
+        local status="未启用" core="未知"
+        _warp_enabled && status="${GREEN}已启用${NC}"
+        if [ -z "$warp_core_ok" ]; then _warp_core_supports_wireguard && warp_core_ok=1 || warp_core_ok=0; fi
+        if [ "$warp_core_ok" = "1" ]; then core="${GREEN}支持${NC}"; else core="${RED}不支持 (缺 with_wireguard)${NC}"; fi
+        echo -e "  状态: ${status}  |  核心: ${core}"
+        echo -e "  默认: Google (Gemini 规则集 + google.com) 走 WARP"
+        echo -e "  自定义域名:"
+        if [ -s "$WARP_STATE_FILE" ]; then
+            jq -r '.custom_domains[]?' "$WARP_STATE_FILE" | sed 's/^/    - /'
         fi
-    fi
-    
-    if [ -f "$script_path" ]; then
-        if ! bash -n "$script_path" 2>/dev/null; then
-            _error "Xray 管理脚本未通过 Bash 语法检查，已拒绝执行: ${script_path}"
-            return 1
-        fi
-        chmod 755 "$script_path"
-        bash "$script_path"
-    else
-        _error "找不到 Xray 管理脚本: ${script_path}"
-    fi
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 启用 WARP (首次自动注册账号)"
+        echo -e "    ${GREEN}[2]${NC} 停用 WARP"
+        echo -e "    ${GREEN}[3]${NC} 添加自定义域名"
+        echo -e "    ${GREEN}[4]${NC} 删除自定义域名"
+        echo -e "    ${GREEN}[5]${NC} 更换 WARP IP (丢弃旧账号重新注册)"
+        echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        local choice
+        read -r -p "  请选择 [0-5]: " choice
+        case "$choice" in
+            1) _warp_enable ;;
+            2) _warp_disable ;;
+            3) _warp_add_domain ;;
+            4) _warp_remove_domain ;;
+            5) _warp_rotate ;;
+            0) return 0 ;;
+            *) _error "无效输入，请重试。" ;;
+        esac
+        echo
+        read -n 1 -s -r -p "按任意键返回..."
+    done
 }
 
 _main_menu() {
@@ -8008,7 +6724,7 @@ _main_menu() {
         echo ' |____/|_|_| |_|\__, |____/ \___/_/\_\'
         echo '                |___/    Lite Manager '
         echo -e "${NC}"
-        
+
         # 版本标题
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
@@ -8016,7 +6732,7 @@ _main_menu() {
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
         echo ""
-        
+
         # 获取系统信息
         local os_info="未知"
         if [ -f /etc/os-release ]; then
@@ -8024,12 +6740,12 @@ _main_menu() {
             [ -z "$os_info" ] && os_info=$(grep -E "^NAME=" /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -1)
         fi
         [ -z "$os_info" ] && os_info=$(uname -s)
-        
+
         # 获取 Sing-box 版本和状态
         local sb_version=""
         local service_status="○ 未知"
         if [ -f "$SINGBOX_BIN" ]; then
-            sb_version=" v$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $3}')"
+            sb_version=" v$(env GOMEMLIMIT="$(_get_mem_limit)MiB" "$SINGBOX_BIN" version 2>/dev/null | head -n1 | awk '{print $3}')"
             if _singbox_core_is_locked; then
                 sb_version="${sb_version} [固定]"
             fi
@@ -8055,136 +6771,72 @@ _main_menu() {
         else
             service_status="${RED}○ 未安装${NC}"
         fi
-        
-        # 获取 Argo 状态 (修复 Alpine/BusyBox 的 ps 截断问题：优先使用 PID 文件检测)
+
+        # Argo 状态 = 元数据里有命名隧道节点且 sing-box 在跑。
         local argo_status="${RED}○ 未安装${NC}"
-        if [ -f "$CLOUDFLARED_BIN" ]; then
-            local argo_running=false
-            # 先迁移元数据中记录的旧 /tmp PID，再遍历受保护运行目录。
-            if [ -s "$ARGO_METADATA_FILE" ]; then
-                local argo_port
-                while IFS= read -r argo_port; do
-                    [[ "$argo_port" =~ ^[0-9]+$ ]] || continue
-                    _migrate_legacy_argo_state "$argo_port" >/dev/null 2>&1 || true
-                done < <(jq -r '.[].local_port // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
-            fi
-            # 方式1 (精准): 遍历 PID 文件，与守护进程 _argo_keepalive 使用相同的检测方式
-            for pid_file in "$RUNTIME_DIR"/argo-*.pid; do
-                [ -f "$pid_file" ] || continue
-                local pid=$(cat "$pid_file" 2>/dev/null)
-                if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
-                    argo_running=true
-                    break
-                fi
-            done
-            # 方式2 (兜底): PID 文件不存在时，尝试 pgrep 或 ps 匹配进程名
-            if [ "$argo_running" = false ]; then
-                if command -v pgrep &>/dev/null; then
-                    pgrep -x cloudflared &>/dev/null && argo_running=true
-                elif ps w 2>/dev/null | grep -v "grep" | grep -q "cloudflared"; then
-                    argo_running=true
-                fi
-            fi
-            if [ "$argo_running" = true ]; then
+        if [ -s "$ARGO_METADATA_FILE" ] && jq -e 'length > 0' "$ARGO_METADATA_FILE" >/dev/null 2>&1; then
+            if _singbox_is_running; then
                 argo_status="${GREEN}● 运行中${NC}"
             else
                 argo_status="${YELLOW}○ 已安装 (未运行)${NC}"
             fi
         fi
-        
-        # 获取 Xray 版本和状态
-        local xray_version=""
-        local xray_status="${RED}○ 未安装${NC}"
-        if [ -f "/usr/local/bin/xray" ]; then
-            xray_version=" v$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')"
-            if [ "$INIT_SYSTEM" == "systemd" ]; then
-                if systemctl is-active --quiet xray 2>/dev/null; then
-                    xray_status="${GREEN}● 运行中${NC}"
-                else
-                    xray_status="${YELLOW}○ 已停止${NC}"
-                fi
-            elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                if rc-service xray status 2>/dev/null | grep -q "started"; then
-                    xray_status="${GREEN}● 运行中${NC}"
-                else
-                    xray_status="${YELLOW}○ 已停止${NC}"
-                fi
-            elif [ "$INIT_SYSTEM" == "direct" ]; then
-                if _direct_xray_pid status "$XRAY_PID_FILE" /usr/local/bin/xray /usr/local/etc/xray/config.json >/dev/null; then
-                    xray_status="${GREEN}● 运行中${NC}"
-                else
-                    xray_status="${YELLOW}○ 已停止${NC}"
-                fi
-            fi
-            local xray_nodes=$(jq '.inbounds | length' /usr/local/etc/xray/config.json 2>/dev/null || echo "0")
-            xray_status="${xray_status} (${xray_nodes}节点)"
-        fi
-        
+
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
-        echo -e "  Xray${CYAN}${xray_version}${NC}: ${xray_status}"
         echo ""
-        
+
         # 节点管理
         echo -e "  ${CYAN}【节点管理】${NC}"
-        echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
-        echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
-        echo -e "    ${GREEN}[5]${NC} 修改节点"
+        echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} 查看节点链接"
+        echo -e "    ${GREEN}[3]${NC} 删除节点          ${GREEN}[4]${NC} 修改节点"
         echo ""
-        
+
         # 服务控制
         echo -e "  ${CYAN}【服务控制】${NC}"
-        echo -e "    ${GREEN}[6]${NC} 重启服务          ${GREEN}[7]${NC} 停止服务"
-        echo -e "    ${GREEN}[8]${NC} 查看运行状态      ${GREEN}[9]${NC} 查看实时日志"
-        echo -e "    ${GREEN}[10]${NC} 定时重启设置"
-        echo -e "    ${GREEN}[11]${NC} 时间诊断/校时"
+        echo -e "    ${GREEN}[5]${NC} 重启服务          ${GREEN}[6]${NC} 停止服务"
+        echo -e "    ${GREEN}[7]${NC} 查看运行状态      ${GREEN}[8]${NC} 查看实时日志"
+        echo -e "    ${GREEN}[9]${NC} 定时重启设置"
+        echo -e "    ${GREEN}[10]${NC} 时间诊断/校时"
         echo ""
-        
+
         # 配置与更新
         echo -e "  ${CYAN}【配置与更新】${NC}"
-        echo -e "    ${GREEN}[12]${NC} 检查配置文件    ${GREEN}[13]${NC} 更新脚本"
-        echo -e "    ${GREEN}[14]${NC} DNS 设置"
+        echo -e "    ${GREEN}[11]${NC} 检查配置文件    ${GREEN}[12]${NC} 更新脚本"
+        echo -e "    ${GREEN}[13]${NC} DNS 设置        ${GREEN}[14]${NC} WARP 设置"
         echo ""
-        
+
         # 核心管理
         echo -e "  ${CYAN}【核心管理】${NC}"
         echo -e "    ${GREEN}[15]${NC} 安装/更新 Sing-box 核心"
-        echo -e "    ${GREEN}[16]${NC} 安装/更新 Xray 核心"
-        echo -e "    ${RED}[17]${NC} 卸载脚本"
+        echo -e "    ${RED}[16]${NC} 卸载脚本"
         echo ""
-        
-        # 进阶功能
-        echo -e "  ${CYAN}【进阶功能】${NC}"
-        echo -e "    ${GREEN}[18]${NC} 落地/中转/第三方节点导入"
-        echo -e "    ${GREEN}[19]${NC} Xray 节点管理"
+
         echo ""
-        
+
         echo -e "  ─────────────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
-        
-        read -p "  请输入选项 [0-19]: " choice
- 
+
+        read -r -p "  请输入选项 [0-16]: " choice
+
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
-            2) _require_singbox && _argo_menu ;;
-            3) _require_singbox && _view_nodes ;;
-            4) _require_singbox && _delete_node ;;
-            5) _require_singbox && _modify_node ;;
-            6) _require_singbox && _manage_service "restart" ;;
-            7) _require_singbox && _manage_service "stop" ;;
-            8) _require_singbox && _manage_service "status" ;;
-            9) _require_singbox && _view_log ;;
-            10) _require_singbox && _scheduled_restart_menu ;;
-            11) _time_menu ;;
-            12) _require_singbox && _check_config ;;
-            13) _update_script ;;
-            14) _require_singbox && _dns_config_menu ;;
+            2) _require_singbox && _view_nodes ;;
+            3) _require_singbox && _delete_node ;;
+            4) _require_singbox && _modify_node ;;
+            5) _require_singbox && _manage_service "restart" ;;
+            6) _require_singbox && _manage_service "stop" ;;
+            7) _require_singbox && _manage_service "status" ;;
+            8) _require_singbox && _view_log ;;
+            9) _require_singbox && _scheduled_restart_menu ;;
+            10) _time_menu ;;
+            11) _require_singbox && _check_config ;;
+            12) _update_script ;;
+            13) _require_singbox && _dns_config_menu ;;
+            14) _require_singbox && _warp_menu ;;
             15) _install_or_update_singbox ;;
-            16) _install_or_update_xray ;;
-            17) _uninstall ;; 
-            18) _advanced_features ;;
-            19) _xray_features ;;
+            16) _uninstall ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -8202,42 +6854,41 @@ _main_menu() {
         echo '  ╚═══════════════════════════════════════╝'
         echo -e "${NC}"
         echo ""
-        
-        # [!] 零依赖策略：不再安装 cron
-        # 仅简单的环境预判
+
+        # 零依赖策略: 不再安装 cron, 仅做简单的环境预判。
         if [ "$INIT_SYSTEM" == "direct" ]; then
             _error "未能识别系统初始化环境 (systemd/openrc)，定时重启功能暂不可用。"
             read -n 1 -s -r -p "按任意键返回..."
             return
         fi
 
-    
+
     # 获取服务器时间信息
     local server_time=$(date '+%Y-%m-%d %H:%M:%S')
     local server_tz_offset=$(date +%z)  # 如: +0800, +0000, -0500
     local server_tz_name=$(date +%Z 2>/dev/null || echo "Unknown")  # 如: CST, UTC
-    
+
     # 解析时区偏移 (格式: +0800 或 -0500)
     local offset_sign="${server_tz_offset:0:1}"
     local offset_hours="${server_tz_offset:1:2}"
     local offset_mins="${server_tz_offset:3:2}"
-    
+
     # 去除前导零
     offset_hours=$((10#$offset_hours))
     offset_mins=$((10#$offset_mins))
-    
+
     # 计算总偏移分钟数
     local server_offset_mins=$((offset_hours * 60 + offset_mins))
     if [ "$offset_sign" == "-" ]; then
         server_offset_mins=$((-server_offset_mins))
     fi
-    
+
     # 北京时间 = UTC+8 = +480 分钟
     local beijing_offset_mins=480
     local diff_mins=$((beijing_offset_mins - server_offset_mins))
     local diff_hours=$((diff_mins / 60))
     local diff_remaining_mins=$((diff_mins % 60))
-    
+
     # 格式化显示
     local diff_display=""
     if [ $diff_mins -gt 0 ]; then
@@ -8253,11 +6904,11 @@ _main_menu() {
     else
         diff_display="服务器与北京时间同步"
     fi
-    
+
     # 检查当前定时任务状态
     local cron_status="未设置"
     local cron_time=""
-    
+
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         if [ -f "/etc/systemd/system/sing-box-restart.timer" ]; then
             cron_time=$(grep "OnCalendar" /etc/systemd/system/sing-box-restart.timer | cut -d' ' -f2 | cut -d: -f1,2)
@@ -8269,7 +6920,7 @@ _main_menu() {
             cron_status="已启用 (每天 ${cron_time} 重启 - OpenRC)"
         fi
     fi
-    
+
     echo -e "  ${CYAN}【服务器时间信息】${NC}"
     echo -e "    当前时间: ${GREEN}${server_time}${NC}"
     echo -e "    时区: ${GREEN}${server_tz_name} (UTC${server_tz_offset})${NC}"
@@ -8289,23 +6940,23 @@ _main_menu() {
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    
-    read -p "  请输入选项 [0-3]: " choice
-    
+
+    read -r -p "  请输入选项 [0-3]: " choice
+
     case $choice in
         1)
             echo ""
             echo -e "  ${CYAN}设置定时重启时间${NC}"
             echo -e "  提示: 输入服务器时区的时间 (24小时制)"
             echo ""
-            read -p "  请输入重启时间 (格式 HH:MM, 如 04:30): " restart_time
-            
+            read -r -p "  请输入重启时间 (格式 HH:MM, 如 04:30): " restart_time
+
             # 验证时间格式
             if [[ ! "$restart_time" =~ ^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
                 _error "时间格式错误！请使用 HH:MM 格式 (如 04:30)"
                 return
             fi
-            
+
             local hour=$(echo "$restart_time" | cut -d: -f1)
             local min=$(echo "$restart_time" | cut -d: -f2)
             local time_str=$(printf "%02d:%02d" "$((10#$hour))" "$((10#$min))")
@@ -8317,7 +6968,7 @@ _main_menu() {
 Description=Sing-box Scheduled Restart
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl restart sing-box
+ExecStart=$(command -v systemctl) restart sing-box
 EOF
                 cat > /etc/systemd/system/sing-box-restart.timer <<EOF
 [Unit]
@@ -8354,15 +7005,15 @@ EOF
                 rc-service sing-box-timer restart 2>/dev/null
                 rc-update add sing-box-timer default 2>/dev/null
             fi
-            
+
             _success "定时重启已通过 ${INIT_SYSTEM} 原生组件设置完成！"
             echo ""
             echo -e "  重启时间: ${GREEN}每天 ${time_str}${NC} (服务器时区)"
-                
+
                 # 计算对应的北京时间
-                local beijing_hour=$((hour + diff_hours))
-                local beijing_min=$((min + diff_remaining_mins))
-                
+                local beijing_hour=$((10#$hour + diff_hours))
+                local beijing_min=$((10#$min + diff_remaining_mins))
+
                 # 处理分钟溢出
                 if [ $beijing_min -ge 60 ]; then
                     beijing_min=$((beijing_min - 60))
@@ -8371,14 +7022,14 @@ EOF
                     beijing_min=$((beijing_min + 60))
                     beijing_hour=$((beijing_hour - 1))
                 fi
-                
+
                 # 处理小时溢出
                 if [ $beijing_hour -ge 24 ]; then
                     beijing_hour=$((beijing_hour - 24))
                 elif [ $beijing_hour -lt 0 ]; then
                     beijing_hour=$((beijing_hour + 24))
                 fi
-                
+
                 echo -e "  对应北京时间: ${YELLOW}$(printf "%02d:%02d" "$beijing_hour" "$beijing_min")${NC}"
             ;;
         2)
@@ -8395,7 +7046,7 @@ EOF
             if [ "$cron_status" == "未设置" ]; then
                 _warning "当前没有设置定时重启"
             else
-                read -p "$(echo -e ${YELLOW}"  确定取消定时重启? (y/N): "${NC})" confirm
+                read -r -p "$(echo -e ${YELLOW}"  确定取消定时重启? (y/N): "${NC})" confirm
                 if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
                     _remove_scheduled_restart_components
                     _success "定时重启已取消，相关系统组件已清理。"
@@ -8411,13 +7062,12 @@ EOF
             _error "无效输入"
             ;;
     esac
-    
+
     echo ""
     read -n 1 -s -r -p "按任意键继续..."
 }
 
-# 主节点创建必须作为一个整体提交：协议生成器会依次修改 JSON、YAML、
-# 凭据和 nftables；任一步失败都恢复创建前状态，且只在组合校验通过后重启一次。
+# 主节点创建整体提交, 任一步失败恢复创建前状态, 校验通过后只重启一次。
 _main_create_tx_snapshot_file() {
     local tx_dir="$1" label="$2" source_file="$3"
     if [ -e "$source_file" ] || [ -L "$source_file" ]; then
@@ -8455,8 +7105,7 @@ _main_create_tx_snapshot() {
         cp -p "$credential" "${tx_dir}/credentials/${credential_name}" || return 1
     done
 
-    # 该表只归 singboxlite 使用。能够枚举 nftables 时保存完整可回放快照；
-    # 不支持 nftables 的容器会由 HY2 自身安全降级为原生多监听。
+    # 该表只归 singboxlite 使用, 能枚举 nftables 时存完整可回放快照, 否则 HY2 降级为原生多监听。
     if command -v nft >/dev/null 2>&1 && nft_tables=$(nft list tables 2>/dev/null); then
         : > "${tx_dir}/nft.available" || return 1
         if printf '%s\n' "$nft_tables" | grep -Eq "^[[:space:]]*table[[:space:]]+inet[[:space:]]+${NFT_TABLE}[[:space:]]*$"; then
@@ -8592,9 +7241,9 @@ _run_main_create_transaction() {
 _batch_create_nodes() {
     local input_str="$1"
     if [ -z "$input_str" ]; then
-        _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
-        _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
-        read -p "协议列表: " input_str
+        _info "请输入协议编号 (空格或逗号分隔，如: 1,2,3)"
+        _warn "注：批量部署不支持过 CDN 协议 (5/6/7)，过 CDN 请单节点创建以填域名。"
+        read -r -p "协议列表: " input_str
     fi
     [ -z "$input_str" ] && return 1
 
@@ -8609,40 +7258,36 @@ _batch_create_nodes() {
     local ss_occurences=0
 
     for pid in $proto_ids; do
-        if [[ ! "$pid" =~ ^(1|2|3|4|5|6|7|8|9|10)$ ]]; then
-            _error "协议 ID $pid 无效，请输入 1-10 范围内的协议编号。"
-            return 1
-        fi
-        if [[ "$pid" =~ ^(2|3|4)$ ]]; then
-            _error "协议 ID $pid (WebSocket/gRPC+TLS) 不支持批量创建，请使用单节点模式单独创建以开启高级 CDN 优化。"
+        if [[ ! "$pid" =~ ^(1|2|3|4|8|9)$ ]]; then
+            _error "协议 ID $pid 无效或不支持批量（可用: 1 直连 Reality, 2 Reality+XHTTP, 3 HY2, 4 TUIC, 8 落地 ENC, 9 SS；5/6/7 过 CDN 请单节点创建）。"
             return 1
         fi
         ((proto_count++))
-        if [[ "$pid" == "8" ]]; then
+        if [[ "$pid" == "9" ]]; then
             has_ss=true
             ((ss_occurences++))
         fi
-        [[ "$pid" =~ ^(6|8)$ ]] && has_complex=true
-        [[ "$pid" =~ ^(1|4|5|6|7)$ ]] && has_sni_req=true
-        [[ "$pid" == "6" ]] && has_hy2=true
+        [[ "$pid" =~ ^(3|9)$ ]] && has_complex=true
+        [[ "$pid" =~ ^(1|2)$ ]] && has_sni_req=true
+        [[ "$pid" == "3" ]] && has_hy2=true
     done
 
     [ $proto_count -eq 0 ] && { _error "未选择任何协议"; return 1; }
 
     # 2. 引导向导
     _info "--- 批量部署引导向导 ---"
-    
+
     # [修复] 强制初始化服务器 IP，防止各协议函数因变量未定义生成空配置
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local batch_ip="${server_ip}"
-    read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
+    read -r -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
     batch_ip=${custom_batch_ip:-$server_ip}
     export BATCH_IP="$batch_ip"
-    
+
     # 2.1 SNI 收集 (强制净化处理)
-    export BATCH_SNI="$DEFAULT_SNI"
+    export BATCH_SNI="$(_pick_random_default_sni)"
     if [ "$has_sni_req" = true ]; then
-        read -p "请输入统一伪装域名 (SNI) [默认: $BATCH_SNI]: " input_sni
+        read -r -p "请输入统一伪装域名 (SNI) [默认: $BATCH_SNI]: " input_sni
         input_sni=$(echo "$input_sni" | xargs)
         [ -n "$input_sni" ] && BATCH_SNI="$input_sni"
     fi
@@ -8652,12 +7297,12 @@ _batch_create_nodes() {
     local hy2_hop="false"
     local hy2_hop_range=""
     if [ "$has_hy2" = true ]; then
-        read -p "是否开启 Hysteria2 QUIC 混淆? (y/N): " hy2_q_choice
+        read -r -p "是否开启 Hysteria2 QUIC 混淆? (y/N): " hy2_q_choice
         [[ "$hy2_q_choice" == "y" ]] && hy2_obfs="salamander"
-        read -p "是否开启 Hysteria2 端口跳跃? (y/N): " hy2_h_choice
+        read -r -p "是否开启 Hysteria2 端口跳跃? (y/N): " hy2_h_choice
         if [[ "$hy2_h_choice" == "y" ]]; then
             hy2_hop="true"
-            read -p "请输入端口跳跃范围 (如 20000-30000): " hy2_hop_range
+            read -r -p "请输入端口跳跃范围 (如 20000-30000): " hy2_hop_range
         fi
     fi
 
@@ -8685,7 +7330,7 @@ _batch_create_nodes() {
         # 计算 SS 实际需要的端口数
         local ss_needed
         ss_needed=$(printf '%s' "$normalized_ss" | wc -w)
-        # 每个 Shadowsocks 协议 ID (8) 额外需要 (ss_needed - 1) 个端口
+        # 每个 Shadowsocks 协议 ID (9) 额外需要 (ss_needed - 1) 个端口
         proto_count=$((proto_count + (ss_needed - 1) * ss_occurences))
     fi
 
@@ -8694,8 +7339,8 @@ _batch_create_nodes() {
     local planned_pid planned_variant
     for planned_pid in $proto_ids; do
         case "$planned_pid" in
-            6|7) planned_protocols+=("udp") ;;
-            8)
+            3|4) planned_protocols+=("udp") ;;
+            9)
                 for planned_variant in $(echo "$ss_variant" | tr ',' ' '); do
                     planned_protocols+=("tcp+udp")
                 done
@@ -8708,7 +7353,7 @@ _batch_create_nodes() {
     local ports_list=()
     _info "共需规划 $proto_count 个批量监听端口。"
     while true; do
-        read -p "请输入端口号 (范围如 10001-10010 或空格分隔): " p_input
+        read -r -p "请输入端口号 (范围如 10001-10010 或空格分隔): " p_input
         local current_p_list=()
         local invalid_port=false
         local duplicate_port=false
@@ -8757,7 +7402,7 @@ _batch_create_nodes() {
         if [ "$invalid_port" = true ] || [ "$duplicate_port" = true ] || [ "$occupied_port" = true ]; then
             continue
         fi
-        
+
         if [ "${#current_p_list[@]}" -lt "$proto_count" ]; then
             _error "输入端口数量不足（仅 ${#current_p_list[@]} 个），请重新输入。"
         else
@@ -8773,8 +7418,8 @@ _batch_create_nodes() {
     local batch_failed=false
     for i in "${!proto_array[@]}"; do
         local pid=${proto_array[$i]}
-        
-        if [ "$pid" == "8" ]; then
+
+        if [ "$pid" == "9" ]; then
             local ss_variants=$(echo "$ss_variant" | tr ',' ' ')
             for v in $ss_variants; do
                 local current_port=${ports_list[$bulk_idx]}
@@ -8792,7 +7437,7 @@ _batch_create_nodes() {
         else
             local current_port=${ports_list[$bulk_idx]}
             _info "正在安装协议 [$pid] 到端口 $current_port..."
-            
+
             export BATCH_MODE="true"
             export BATCH_PORT="$current_port"
             export BATCH_HY2_OBFS="$hy2_obfs"
@@ -8800,14 +7445,10 @@ _batch_create_nodes() {
 
             case $pid in
                 1) _add_vless_reality || batch_failed=true ;;
-                2) _add_vless_ws_tls || batch_failed=true ;;
-                3) _add_trojan_ws_tls || batch_failed=true ;;
-                4) _add_vless_grpc_tls || batch_failed=true ;;
-                5) _add_anytls || batch_failed=true ;;
-                6) _add_hysteria2 || batch_failed=true ;;
-                7) _add_tuic || batch_failed=true ;;
-                9) _add_vless_tcp || batch_failed=true ;;
-                10) _add_socks || batch_failed=true ;;
+                2) _add_vless_xhttp_reality_enc || batch_failed=true ;;
+                3) _add_hysteria2 || batch_failed=true ;;
+                4) _add_tuic || batch_failed=true ;;
+                8) _add_vless_enc_tcp || batch_failed=true ;;
             esac
             [ "$batch_failed" = false ] || break
             ((bulk_idx++))
@@ -8820,7 +7461,7 @@ _batch_create_nodes() {
         _error "批量创建在第 $((bulk_idx + 1)) 个节点失败，整批操作将回滚。"
         return 1
     fi
-    
+
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
     _success "所有节点已按直连模式部署完毕。"
@@ -8833,6 +7474,7 @@ _batch_create_nodes() {
 
 _show_add_node_menu() {
     [ -z "$server_ip" ] && _init_server_ip
+    _sync_argo_early_data
     clear
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
@@ -8840,32 +7482,27 @@ _show_add_node_menu() {
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     echo ""
-    
-    echo -e "  ${CYAN}【协议选择】${NC}"
+
+    echo -e "  ${CYAN}【直连】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
-    echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
-    echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"
-    echo -e "    ${GREEN}[5]${NC} AnyTLS"
-    echo -e "    ${GREEN}[6]${NC} Hysteria2"
-    echo -e "    ${GREEN}[7]${NC} TUICv5"
-    echo -e "    ${GREEN}[8]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
-    echo -e "    ${GREEN}[10]${NC} SOCKS5"
-    echo -e "    ${GREEN}[12]${NC} Snell v6"
+    echo -e "    ${GREEN}[2]${NC} VLESS + XHTTP + Reality + ENC + Vision"
+    echo -e "    ${GREEN}[3]${NC} Hysteria2"
+    echo -e "    ${GREEN}[4]${NC} TUICv5"
+    echo -e "  ${CYAN}【过 CDN】${NC}"
+    echo -e "    ${GREEN}[5]${NC} VLESS + XHTTP + TLS + ENC + Vision (CDN回源)"
+    echo -e "    ${GREEN}[6]${NC} VLESS + XHTTP + TLS + ENC + Vision (Argo隧道)"
+    echo -e "    ${GREEN}[7]${NC} VLESS + Websocket + TLS + ENC + Vision (Argo隧道)"
+    echo -e "  ${CYAN}【落地】${NC}"
+    echo -e "    ${GREEN}[8]${NC} VLESS + TCP + ENC + Vision (无 TLS)"
+    echo -e "    ${GREEN}[9]${NC} Shadowsocks"
     echo ""
-    
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[11]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[10]${NC} 批量创建节点 (不支持过 CDN 协议 5/6/7)"
     echo ""
-    
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
-    
-    read -p "  请输入选项 [0-12]: " choice
-
-    # 如果输入包含逗号或空格，自动进入批量处理模式
+    read -r -p "  请输入选项 [0-10]: " choice
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
         _run_main_create_transaction _batch_create_nodes "$choice"
         return $?
@@ -8873,17 +7510,15 @@ _show_add_node_menu() {
 
     case $choice in
         1) _run_main_create_transaction _add_vless_reality ;;
-        2) _run_main_create_transaction _add_vless_ws_tls ;;
-        3) _run_main_create_transaction _add_trojan_ws_tls ;;
-        4) _run_main_create_transaction _add_vless_grpc_tls ;;
-        5) _run_main_create_transaction _add_anytls ;;
-        6) _run_main_create_transaction _add_hysteria2 ;;
-        7) _run_main_create_transaction _add_tuic ;;
-        8) _run_main_create_transaction _add_shadowsocks_menu ;;
-        9) _run_main_create_transaction _add_vless_tcp ;;
-        10) _run_main_create_transaction _add_socks ;;
-        11) _run_main_create_transaction _batch_create_nodes ;;
-        12) _run_main_create_transaction _add_snell_v6 ;;
+        2) _run_main_create_transaction _add_vless_xhttp_reality_enc ;;
+        3) _run_main_create_transaction _add_hysteria2 ;;
+        4) _run_main_create_transaction _add_tuic ;;
+        5) _run_main_create_transaction _add_vless_xhttp_enc_tls ;;
+        6) _run_main_create_transaction _add_argo_vless_xhttp_enc ;;
+        7) _run_main_create_transaction _add_argo_vless_ws_enc ;;
+        8) _run_main_create_transaction _add_vless_enc_tcp ;;
+        9) _run_main_create_transaction _add_shadowsocks_menu ;;
+        10) _run_main_create_transaction _batch_create_nodes ;;
         0) return ;;
         *) _error "无效输入，请重试。"; return 1 ;;
     esac
@@ -8894,22 +7529,18 @@ _show_add_node_menu() {
 main() {
     _check_root
     _detect_init_system
-    
+
     # 强制预创建目录，防止后续 cp/mv 因路径不存在报错 (保底机制)
     mkdir -p "${SINGBOX_DIR}" 2>/dev/null
     chmod 700 "${SINGBOX_DIR}" 2>/dev/null || true
-    
+
     # 1. 首次安装或依赖状态失效时才完整检查，避免每次 sb 进入菜单都触发包管理器
-    if [ -x "$SINGBOX_BIN" ]; then
-        _install_dependencies
-    else
-        _install_menu_dependencies || return 1
-    fi
-    
+    _install_dependencies
+
     # 2. 根据核心安装状态决定初始化路径
     if [ -f "${SINGBOX_BIN}" ]; then
         # --- sing-box 已安装：执行完整的初始化与自愈检测 ---
-        
+
         # 3. 检查配置文件
         if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${CLASH_YAML_FILE}" ]; then
              _info "检测到主配置文件缺失，正在初始化..."
@@ -8919,61 +7550,25 @@ main() {
         # 3.1 初始化中转配置 (配置隔离)
         _init_relay_config
         _ensure_relay_config || { _error "无法初始化 relay.json。"; return 1; }
-        
-        # 3.2 [关键修复] 清理主配置文件中的旧版残留
+
         local config_updated=false
-        if _cleanup_legacy_config; then
-            config_updated=true
-        fi
-        
-        # 3.3 [热修复] 检测并补充 DNS 模块
+
+        # 3.2 [热修复] 检测并补充 DNS 模块
         if _check_and_fix_dns; then
             config_updated=true
         fi
 
-        # 兼容旧版默认配置：缺少初始化记录时补做一次 NTP 探测。
+        # 新旧配置均按能力探测选择核心 NTP，不按 Podman/LXC 名称禁用。
         local ntp_before ntp_after
         ntp_before=$(jq -cS '.ntp // null' "$CONFIG_FILE")
         _time_prepare_ntp_config || { _error "时间补偿配置准备失败"; return 1; }
         ntp_after=$(jq -cS '.ntp // null' "$CONFIG_FILE")
         [ "$ntp_before" = "$ntp_after" ] || config_updated=true
-        
+
         if [ "$config_updated" = true ]; then
             _manage_service restart
         fi
-        
-        # [BUG FIX] 检查并修复旧版服务文件
-        if [ -f "$SERVICE_FILE" ]; then
-            local need_update=false
-            if grep -q "\-C " "$SERVICE_FILE"; then
-                _warn "检测到旧版服务配置(目录加载模式导致冲突)，正在修复..."
-                need_update=true
-            fi
-            if grep -q "ENABLE_DEPRECATED_" "$SERVICE_FILE"; then
-                _warn "检测到 sing-box 1.14 已移除功能的旧兼容环境变量，正在清理..."
-                need_update=true
-            fi
-            if [ "$INIT_SYSTEM" == "openrc" ] && ! grep -q "supervisor=" "$SERVICE_FILE"; then
-                _warn "检测到旧版 OpenRC 服务配置，正在修复以兼容 Alpine..."
-                need_update=true
-            fi
-            if [ "$INIT_SYSTEM" == "openrc" ] && { ! grep -Fq "pidfile=\"${PID_FILE}\"" "$SERVICE_FILE" || ! grep -Fq "checkpath -d -m 0700 ${RUNTIME_DIR}" "$SERVICE_FILE"; }; then
-                _warn "检测到旧版 OpenRC PID 路径，正在迁移到 ${PID_FILE}..."
-                need_update=true
-            fi
-            if [ "$need_update" = true ]; then
-                if [ "$INIT_SYSTEM" == "systemd" ]; then
-                     _create_systemd_service
-                     systemctl daemon-reload
-                elif [ "$INIT_SYSTEM" == "openrc" ]; then
-                     _create_openrc_service
-                fi
-                if { [ "$INIT_SYSTEM" == "systemd" ] && systemctl is-active sing-box >/dev/null 2>&1; } || { [ "$INIT_SYSTEM" == "openrc" ] && rc-service sing-box status >/dev/null 2>&1; }; then
-                    _manage_service restart
-                fi
-                _success "服务配置修复完成。"
-            fi
-        fi
+
 
         # 4. 首次安装或服务文件缺失时才创建，避免每次进入菜单都重写服务文件
         if [ -n "$SERVICE_FILE" ] && [ ! -f "$SERVICE_FILE" ]; then
@@ -8982,25 +7577,29 @@ main() {
             touch "$LOG_FILE"
         fi
         _setup_log_cleanup
+        _enable_memwatch >/dev/null 2>&1 || true
         _secure_state_permissions
-        # 已有 Argo 节点升级脚本后也要补齐开机守护，避免只在新建或手动重启时修复。
-        if [ -s "$ARGO_METADATA_FILE" ] \
-            && jq -e 'type == "object" and length > 0' "$ARGO_METADATA_FILE" >/dev/null 2>&1; then
-            _enable_argo_watchdog || _warn "已有 Argo 节点的开机守护修复失败；请检查 cron/OpenRC 状态。"
-        fi
     else
         # --- sing-box 未安装：仅显示提示，不自动安装 ---
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
     fi
-    
+
     _main_menu
 }
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        keepalive)
-            _argo_keepalive
+        memwatch)
+            _memwatch
+            exit 0
+            ;;
+        memwatch-enable)
+            _enable_memwatch
+            exit $?
+            ;;
+        memwatch-disable)
+            _disable_memwatch
             exit 0
             ;;
         cleanup-logs)
