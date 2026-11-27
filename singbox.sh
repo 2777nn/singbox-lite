@@ -6,7 +6,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-export SCRIPT_VERSION="45"
+export SCRIPT_VERSION="44"
 # 默认 SNI 候选池：新建节点回车默认时随机取一个，避免所有节点共用同一 SNI。
 DEFAULT_SNI_POOL=("www.analog.com" "dl-cdn.alpinelinux.org" "deb.debian.org" "crates.io" "pypi.org" "rubygems.org" "addons.mozilla.org" "formulae.brew.sh" "static.rust-lang.org" "cpan.org")
 _pick_random_default_sni() { local _r; _r=$(od -An -tu2 -N2 /dev/urandom 2>/dev/null | tr -d ' '); [[ "$_r" =~ ^[0-9]+$ ]] || _r=$RANDOM; printf '%s\n' "${DEFAULT_SNI_POOL[$((_r % ${#DEFAULT_SNI_POOL[@]}))]}"; }
@@ -6324,7 +6324,7 @@ _do_update_singbox() {
 _warp_state_init() {
     mkdir -p "$SINGBOX_DIR" || return 1
     if [ ! -s "$WARP_STATE_FILE" ]; then
-        printf '%s\n' '{"enabled":false,"custom_domains":[],"ip_mode":"ipv6_only"}' > "$WARP_STATE_FILE" || return 1
+        printf '%s\n' '{"enabled":false,"custom_domains":[]}' > "$WARP_STATE_FILE" || return 1
     fi
     chmod 600 "$WARP_STATE_FILE" 2>/dev/null || true
     jq empty "$WARP_STATE_FILE" >/dev/null 2>&1
@@ -6336,27 +6336,6 @@ _warp_enabled() {
 
 _warp_has_credentials() {
     [ -s "$WARP_STATE_FILE" ] && jq -e '(.private_key // "" | length > 0) and (.address // [] | length > 0) and (.reserved // [] | length == 3)' "$WARP_STATE_FILE" >/dev/null 2>&1
-}
-
-# WARP 流量走哪个 IP 版本。值直接就是 sing-box 的 DNS strategy：
-# ipv6_only / prefer_ipv6 / ipv4_only / prefer_ipv4。老状态文件没这字段
-# 时按默认 ipv6_only 算；非法值也回落到 ipv6_only，不让脏数据把隧道配死。
-_warp_ip_mode() {
-    local mode
-    mode=$(jq -r '.ip_mode // "ipv6_only"' "$WARP_STATE_FILE" 2>/dev/null)
-    case "$mode" in
-        ipv6_only|prefer_ipv6|ipv4_only|prefer_ipv4) printf '%s' "$mode" ;;
-        *) printf '%s' "ipv6_only" ;;
-    esac
-}
-
-_warp_ip_mode_label() {
-    case "$(_warp_ip_mode)" in
-        ipv6_only) printf '%s' "仅 IPv6 (默认)" ;;
-        prefer_ipv6) printf '%s' "IPv6 优先" ;;
-        ipv4_only) printf '%s' "仅 IPv4" ;;
-        prefer_ipv4) printf '%s' "IPv4 优先" ;;
-    esac
 }
 
 _warp_install_wgcf() {
@@ -6456,38 +6435,11 @@ _warp_apply_config() {
     if ! _warp_enabled; then _warp_remove_config; return 0; fi
     _warp_has_credentials || { _error "WARP 凭据不完整，请先重新启用。"; return 1; }
     local endpoint_json remote_json custom_json rule_sets_json warp_ip srs_tmp offline="${1:-}"
-    local ip_mode addr_json allowed_json
     warp_ip=$(_warp_resolve_peer_ip)
     _info "WARP 节点地址：${warp_ip}:2408（${WARP_ENDPOINT_HOST} 解析结果）"
-    # IP 模式同时管两处，缺一处就锁不死：
-    # 1) 路由 resolve 规则的 strategy：warp 域名按这个版本解析；
-    # 2) wireguard endpoint 的 address + allowed_ips：only 模式只留对应
-    #    版本，另一版本连隧道都进不去。prefer 模式两处都留双栈。
-    # 注意端点的 domain_resolver 不管目标域名（官方文档：非 direct 出站
-    # 只影响 server 地址里的域名），别再往那上面加 strategy。
-    ip_mode=$(_warp_ip_mode)
-    case "$ip_mode" in
-        ipv6_only)
-            addr_json=$(jq -c '[.address[]? | select(test(":"))]' "$WARP_STATE_FILE")
-            allowed_json='["::/0"]'
-            ;;
-        ipv4_only)
-            addr_json=$(jq -c '[.address[]? | select(test(":") | not)]' "$WARP_STATE_FILE")
-            allowed_json='["0.0.0.0/0"]'
-            ;;
-        *)
-            addr_json=$(jq -c '.address' "$WARP_STATE_FILE")
-            allowed_json='["0.0.0.0/0","::/0"]'
-            ;;
-    esac
-    if [ -z "$addr_json" ] || [ "$addr_json" = "[]" ]; then
-        _error "WARP 账号没有 ${ip_mode} 对应的地址，无法按该模式启用。"
-        return 1
-    fi
-    endpoint_json=$(jq -c --arg pk "$WARP_PUBLIC_KEY" --arg host "$warp_ip" \
-        --argjson addr "$addr_json" --argjson allowed "$allowed_json" '
-        {type:"wireguard", tag:"warp", address:$addr, private_key:.private_key,
-         peers:[{address:$host, port:2408, public_key:$pk, allowed_ips:$allowed, reserved:.reserved}],
+    endpoint_json=$(jq -c --arg pk "$WARP_PUBLIC_KEY" --arg host "$warp_ip" '
+        {type:"wireguard", tag:"warp", address:.address, private_key:.private_key,
+         peers:[{address:$host, port:2408, public_key:$pk, allowed_ips:["0.0.0.0/0","::/0"], reserved:.reserved}],
          mtu:1280}
     ' "$WARP_STATE_FILE") || return 1
     # 远程规则集不用 remote + download_detour：1.15 里已废弃，run 时直接 FATAL（check 不触发）。
@@ -6513,17 +6465,16 @@ _warp_apply_config() {
         rule_sets_json='["warp-custom"]'
     fi
     custom_json=$(_warp_custom_ruleset_json) || return 1
-    # warp 域名先走 resolve 规则（strategy 即 ip_mode：ipv6_only 默认只解
-    # v6、无 AAAA 的域名会直接不通；prefer_* 有就走该版本、没有回落另一
-    # 版本），再走 warp 出站。resolve 规则的 strategy 是官方文档里的正式
-    # 字段（1.12/1.14 文档都在），不是废弃项，1.14.3/1.15 上 check 能过。
+    # warp 域名先走 resolve 规则（prefer_ipv6 解析，v6 优先、v6 没有回落 v4，不锁死），
+    # 再走 warp 出站。端点 DialContext 只接受 IP，目标域名由路由层解析，
+    # 所以端点的 domain_resolver 对目标域名无效，必须用路由 resolve 规则。
     _atomic_modify_json "$CONFIG_FILE" '
         .endpoints = ((.endpoints // []) | map(select(.tag != "warp")) + [$ep])
         | .route = (.route // {"rules":[]})
         | .route.rule_set = ((.route.rule_set // []) | map(select(.tag != "geosite-google-gemini" and .tag != "warp-custom")) + (if $rs == null then [] else [$rs] end) + [$cs])
-        | .route.rules = ([{rule_set:$rsl, action:"resolve", server:"dns-local", strategy:$strategy}, {rule_set:$rsl, outbound:"warp"}] + ((.route.rules // []) | map(select(.outbound != "warp" and (([.rule_set[]?] | index("warp-custom") | not))))))
+        | .route.rules = ([{rule_set:$rsl, action:"resolve", server:"dns-local", strategy:"prefer_ipv6"}, {rule_set:$rsl, outbound:"warp"}] + ((.route.rules // []) | map(select(.outbound != "warp" and (([.rule_set[]?] | index("warp-custom") | not))))))
         | .experimental = ((.experimental // {}) + {cache_file:{enabled:true, path:$cache}})
-    ' --argjson ep "$endpoint_json" --argjson rs "$remote_json" --argjson cs "$custom_json" --argjson rsl "$rule_sets_json" --arg strategy "$ip_mode" --arg cache "${SINGBOX_DIR}/cache.db" || return 1
+    ' --argjson ep "$endpoint_json" --argjson rs "$remote_json" --argjson cs "$custom_json" --argjson rsl "$rule_sets_json" --arg cache "${SINGBOX_DIR}/cache.db" || return 1
     _check_combined_config_files || return 1
 }
 
@@ -6560,7 +6511,7 @@ _warp_enable() {
         _manage_service "restart" >/dev/null 2>&1 || true
         return 1
     fi
-    _success "WARP 已启用（IP 版本：$(_warp_ip_mode_label)）：Google (Gemini 规则集 + google.com) 与自定义域名走 WARP，其余直连。"
+    _success "WARP 已启用：Google (Gemini 规则集 + google.com) 与自定义域名走 WARP，其余直连。"
     _info "验证：用客户端访问 google.com 应不再跳到 google.com.hk；https://1.1.1.1/cdn-cgi/trace 应显示 warp=on。"
 }
 
@@ -6574,9 +6525,8 @@ _warp_disable() {
 
 # 换 IP：丢弃旧账号重新注册，自定义域名保留；未启用时只换账号不启用。
 _warp_rotate() {
-    local domains ip_mode was_enabled=0 confirm backup_dir
+    local domains was_enabled=0 confirm backup_dir
     domains=$(jq -c '.custom_domains // []' "$WARP_STATE_FILE" 2>/dev/null || echo '[]')
-    ip_mode=$(_warp_ip_mode)
     _warp_enabled && was_enabled=1
     read -r -p "  换 IP 会丢弃当前 WARP 账号并重新注册（注册失败会恢复旧账号），自定义域名保留，确定吗？[y/N] " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消。"; return 0; }
@@ -6592,9 +6542,7 @@ _warp_rotate() {
         _error "WARP 重新注册失败，已恢复旧账号。"
         return 1
     fi
-    # 新账号只带凭据：自定义域名与 IP 模式都得从旧账号带回来，不然换一次
-    # IP 就把模式打回默认；注册失败时旧文件整份恢复，模式也跟着回来。
-    _atomic_modify_json "$WARP_STATE_FILE" '.custom_domains = $d | .ip_mode = $m' --argjson d "$domains" --arg m "$ip_mode" || {
+    _atomic_modify_json "$WARP_STATE_FILE" '.custom_domains = $d' --argjson d "$domains" || {
         mv -f -- "$backup_dir/warp.json" "$WARP_STATE_FILE" 2>/dev/null || true
         mv -f -- "$backup_dir/wgcf-account.toml" "$WARP_ACCOUNT_FILE" 2>/dev/null || true
         mv -f -- "$backup_dir/wgcf-profile.conf" "$WARP_PROFILE_FILE" 2>/dev/null || true
@@ -6720,39 +6668,6 @@ _warp_remove_domain() {
     _success "已删除 ${#to_remove[@]} 个域名: ${to_remove[*]}"
 }
 
-# 改 IP 模式：只写状态文件，启用中就地重配 + 重启；未启用则下次启用时生效。
-# 有 .srs 缓存时用 --offline 重配（跟加/删域名同一路子），别为换个模式多拉一次规则集。
-_warp_set_ip_mode() {
-    _warp_state_init || return 1
-    local current choice mode
-    current=$(_warp_ip_mode)
-    echo "  当前: $(_warp_ip_mode_label)"
-    echo "    [1] 仅 IPv6 (默认；WARP 流量只走 v6，没有 AAAA 的域名会不通)"
-    echo "    [2] IPv6 优先 (有 v6 走 v6，没有回落 v4)"
-    echo "    [3] 仅 IPv4 (WARP 流量只走 v4)"
-    echo "    [4] IPv4 优先 (有 v4 走 v4，没有回落 v6)"
-    echo "    [0] 取消"
-    read -r -p "  请选择 [0-4]: " choice
-    case "$choice" in
-        1) mode="ipv6_only" ;;
-        2) mode="prefer_ipv6" ;;
-        3) mode="ipv4_only" ;;
-        4) mode="prefer_ipv4" ;;
-        0) return 0 ;;
-        *) _error "无效输入，请重试。" ; return 1 ;;
-    esac
-    if [ "$mode" = "$current" ]; then _info "已是该模式，无需改动。"; return 0; fi
-    _atomic_modify_json "$WARP_STATE_FILE" '.ip_mode = $m' --arg m "$mode" || return 1
-    _success "WARP IP 模式已改为：$mode"
-    if _warp_enabled; then
-        if [ -s "$WARP_RULE_SET_FILE" ]; then
-            _warp_apply_config --offline && _manage_service "restart" || return 1
-        else
-            _warp_apply_config && _manage_service "restart" || return 1
-        fi
-    fi
-}
-
 _warp_menu() {
     local warp_core_ok=""
     while true; do
@@ -6769,7 +6684,6 @@ _warp_menu() {
         if [ "$warp_core_ok" = "1" ]; then core="${GREEN}支持${NC}"; else core="${RED}不支持 (缺 with_wireguard)${NC}"; fi
         echo -e "  状态: ${status}  |  核心: ${core}"
         echo -e "  默认: Google (Gemini 规则集 + google.com) 走 WARP"
-        echo -e "  IP 版本: $(_warp_ip_mode_label)"
         echo -e "  自定义域名:"
         if [ -s "$WARP_STATE_FILE" ]; then
             jq -r '.custom_domains[]?' "$WARP_STATE_FILE" | sed 's/^/    - /'
@@ -6780,18 +6694,16 @@ _warp_menu() {
         echo -e "    ${GREEN}[3]${NC} 添加自定义域名"
         echo -e "    ${GREEN}[4]${NC} 删除自定义域名"
         echo -e "    ${GREEN}[5]${NC} 更换 WARP IP (丢弃旧账号重新注册)"
-        echo -e "    ${GREEN}[6]${NC} 切换 WARP 走 v4 还是 v6"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
         local choice
-        read -r -p "  请选择 [0-6]: " choice
+        read -r -p "  请选择 [0-5]: " choice
         case "$choice" in
             1) _warp_enable ;;
             2) _warp_disable ;;
             3) _warp_add_domain ;;
             4) _warp_remove_domain ;;
             5) _warp_rotate ;;
-            6) _warp_set_ip_mode ;;
             0) return 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
